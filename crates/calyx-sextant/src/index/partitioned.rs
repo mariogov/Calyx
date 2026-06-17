@@ -23,10 +23,9 @@
 //! hold more than one region's vectors at a time.
 
 mod balance;
+mod search;
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
 
 use calyx_core::{CxId, Result, SlotId};
 use rand::{Rng, SeedableRng};
@@ -38,6 +37,7 @@ use crate::index::{
     DiskAnnBuildParams, DiskAnnSearch, DiskAnnSearchParams, SpannCentroidIndex, build_centroids,
 };
 use balance::balance_regions;
+pub use search::PartitionedSearch;
 
 const MANIFEST_FILE: &str = "partitioned-manifest.json";
 const CENTROID_DIR: &str = "idx/slot_00.sparse";
@@ -137,8 +137,100 @@ fn ids_rel(region: u32) -> String {
     format!("idx/region_{region:05}.ids")
 }
 
-/// Build the partitioned vault under `root`. Memory-bounded: never holds more
-/// than `chunk` rows (assignment) or one region's rows (graph build).
+/// Stream every cx through `centroids`, bucketing each by the SAME nearest-centroid
+/// routing a query uses at search time (`assign_hnsw`, i.e. `nearest_centroids`
+/// top-1). Using the identical routing path for assignment and search keeps a point's
+/// region equal to the region its own query probes (#711). Memory-bounded: vectors
+/// are pulled from the source in `chunk`-sized batches, never all at once.
+fn stream_assign(
+    centroids: &SpannCentroidIndex,
+    source: &dyn VectorSource,
+    chunk: usize,
+) -> Vec<Vec<u64>> {
+    let r = centroids.centroid_count();
+    let n = source.len();
+    let chunk = chunk.max(1) as u64;
+    let mut buckets: Vec<Vec<u64>> = vec![Vec::new(); r];
+    let mut start = 0u64;
+    while start < n {
+        let end = (start + chunk).min(n);
+        let assigned: Vec<(u64, u32)> = (start..end)
+            .into_par_iter()
+            .map(|idx| (idx, centroids.assign_hnsw(&source.row(idx))))
+            .collect();
+        for (idx, region) in assigned {
+            if let Some(bucket) = buckets.get_mut(region as usize) {
+                bucket.push(idx);
+            }
+        }
+        start = end;
+    }
+    buckets
+}
+
+/// Source of the vectors a partitioned vault is built from. The real, production
+/// path reads genuine embeddings from a `.fbin` produced by the real embedder
+/// ([`FbinSource`]). [`SyntheticSource`] exists ONLY for builder-logic unit tests
+/// (does every cx land in one region? does balancing hold the cap?) and must NEVER
+/// back a recall or FSV claim — recall is meaningless on fabricated geometry.
+pub trait VectorSource: Sync {
+    fn dim(&self) -> usize;
+    fn len(&self) -> u64;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// The embedding of row `idx` (`0..len`).
+    fn row(&self, idx: u64) -> Vec<f32>;
+}
+
+/// Real embeddings memory-mapped from a `.fbin` on disk — the billion-scale build
+/// path. No vectors are synthesised.
+pub struct FbinSource {
+    vectors: crate::index::vecfile::FbinVectors,
+}
+
+impl FbinSource {
+    pub fn open(path: &Path) -> Result<Self> {
+        Ok(Self {
+            vectors: crate::index::vecfile::FbinVectors::open(path)?,
+        })
+    }
+}
+
+impl VectorSource for FbinSource {
+    fn dim(&self) -> usize {
+        self.vectors.dim()
+    }
+    fn len(&self) -> u64 {
+        self.vectors.count()
+    }
+    fn row(&self, idx: u64) -> Vec<f32> {
+        self.vectors.row(idx).to_vec()
+    }
+}
+
+/// Deterministic synthetic rows. Builder-logic unit tests ONLY — never validation.
+pub struct SyntheticSource {
+    pub seed: u64,
+    pub dim: usize,
+    pub n_cx: u64,
+}
+
+impl VectorSource for SyntheticSource {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn len(&self) -> u64 {
+        self.n_cx
+    }
+    fn row(&self, idx: u64) -> Vec<f32> {
+        gen_row(self.seed, idx, self.dim)
+    }
+}
+
+/// Build a partitioned vault from a deterministic synthetic source. Unit-test /
+/// builder-logic helper only — for real validation use
+/// [`build_partitioned_vault_from_source`] with an [`FbinSource`].
 pub fn build_partitioned_vault(
     root: &Path,
     p: PartitionBuildParams,
@@ -149,16 +241,42 @@ pub fn build_partitioned_vault(
             "partitioned vault requires nonzero n_cx, dim, n_regions",
         ));
     }
+    let source = SyntheticSource {
+        seed: p.seed,
+        dim: p.dim,
+        n_cx: p.n_cx,
+    };
+    build_partitioned_vault_from_source(root, &source, p)
+}
+
+/// Build the partitioned vault under `root` from REAL vectors in `source`.
+/// Memory-bounded: never holds more than `chunk` rows (assignment) or one region's
+/// rows (graph build). `n_cx` and `dim` come from the source (the file is the source
+/// of truth); `p.n_cx`/`p.dim` are ignored.
+pub fn build_partitioned_vault_from_source(
+    root: &Path,
+    source: &dyn VectorSource,
+    p: PartitionBuildParams,
+) -> Result<PartitionedManifest> {
+    let dim = source.dim();
+    let n_cx = source.len();
+    if n_cx == 0 || dim == 0 || p.n_regions == 0 {
+        return Err(crate::error::sextant_error(
+            crate::error::CALYX_INDEX_INVALID_PARAMS,
+            "partitioned vault requires nonzero source len, dim, n_regions",
+        ));
+    }
     std::fs::create_dir_all(root.join(CENTROID_DIR))
         .map_err(|e| crate::error::sextant_error(crate::error::CALYX_INDEX_IO, e.to_string()))?;
 
     // 1. Centroids from a deterministic sample (stride over the index space).
-    let stride = (p.n_cx / p.sample.max(1) as u64).max(1);
-    let sample_rows: Vec<(u32, Vec<f32>)> = (0..p.sample)
+    let sample = p.sample.min(n_cx as usize).max(1);
+    let stride = (n_cx / sample as u64).max(1);
+    let sample_rows: Vec<(u32, Vec<f32>)> = (0..sample)
         .into_par_iter()
         .map(|s| {
-            let idx = (s as u64 * stride) % p.n_cx;
-            (s as u32, gen_row(p.seed, idx, p.dim))
+            let idx = (s as u64 * stride) % n_cx;
+            (s as u32, source.row(idx))
         })
         .collect();
     let centroids = build_centroids(&sample_rows, p.n_regions, p.seed);
@@ -175,12 +293,12 @@ pub fn build_partitioned_vault(
     let use_hnsw_assign = r > HNSW_ASSIGN_MIN_CENTROIDS;
     let mut buckets: Vec<Vec<u64>> = vec![Vec::new(); r];
     let mut start = 0u64;
-    while start < p.n_cx {
-        let end = (start + p.chunk as u64).min(p.n_cx);
+    while start < n_cx {
+        let end = (start + p.chunk as u64).min(n_cx);
         let assigned: Vec<(u64, u32)> = (start..end)
             .into_par_iter()
             .map(|idx| {
-                let row = gen_row(p.seed, idx, p.dim);
+                let row = source.row(idx);
                 let region = if use_hnsw_assign {
                     centroids.assign_hnsw(&row)
                 } else {
@@ -201,12 +319,23 @@ pub fn build_partitioned_vault(
     //     via local k-means, then rebuild the routing layer over the FINAL centroid
     //     set so search still routes correctly. cap = target mean: the recursive
     //     splitter enforces this hard bound, keeping final max/mean near 1-2x.
-    let mean_region = (p.n_cx as usize).div_ceil(r.max(1));
+    let mean_region = (n_cx as usize).div_ceil(r.max(1));
     let cap = mean_region.max(MIN_REGION_CAP);
-    let (final_centroids, buckets) = balance_regions(&centroids, buckets, p.seed, p.dim, cap);
+    let (final_centroids, _provisional) = balance_regions(&centroids, buckets, p.seed, dim, cap);
     let centroids =
-        SpannCentroidIndex::from_parts(p.dim as u32, final_centroids, Vec::new(), Vec::new())?;
+        SpannCentroidIndex::from_parts(dim as u32, final_centroids, Vec::new(), Vec::new())?;
     centroids.save(root.join(CENTROID_DIR))?;
+
+    // 2c. Re-bucket every cx against the FINAL centroids through the EXACT routing a
+    //     query uses (`assign_hnsw` == `nearest_centroids` top-1). Load-bearing for
+    //     recall (#711): step 2 bucketed against the INITIAL centroids (and, for
+    //     moderate R, by exact L2), but queries route via the FINAL centroid HNSW.
+    //     Those disagree, so a point's region was not the region its own query routes
+    //     to — proven on REAL msmarco: probing ALL regions recalls 0.999, but probing
+    //     the routed few recalls 0.38 (the right region was never probed). Re-bucketing
+    //     through the same routing path makes assignment and routing consistent, so the
+    //     routed regions actually contain a query's neighbours. Memory-bounded stream.
+    let buckets = stream_assign(&centroids, source, p.chunk);
 
     // 3. Build one DiskANN graph per region (each fits RAM). Regions are built
     //    in PARALLEL across cores (#706): each region is small and serial row-gen
@@ -216,7 +345,7 @@ pub fn build_partitioned_vault(
     //    guarantee. Each region writes to a distinct graph/ids path, so the
     //    concurrent builds never contend.
     let build_params = DiskAnnBuildParams {
-        dim: p.dim,
+        dim,
         m_max: p.m_max,
         ef_construction: p.ef_construction,
         alpha: 1.2,
@@ -241,7 +370,7 @@ pub fn build_partitioned_vault(
             // nesting another parallel gen would only add scheduler overhead.
             let rows: Vec<(CxId, Vec<f32>)> = members
                 .iter()
-                .map(|&idx| (cx(idx), gen_row(p.seed, idx, p.dim)))
+                .map(|&idx| (cx(idx), source.row(idx)))
                 .collect();
             let graph_path = root.join(graph_rel(region));
             // NOTE: `build_diskann_graph` parallelizes internally. Running this
@@ -290,8 +419,8 @@ pub fn build_partitioned_vault(
 
     let manifest = PartitionedManifest {
         format: "calyx-partitioned-vault-v1".to_string(),
-        n_cx: p.n_cx,
-        dim: p.dim,
+        n_cx,
+        dim,
         n_regions: centroids.centroid_count(),
         seed: p.seed,
         m_max: p.m_max,
@@ -323,115 +452,6 @@ fn read_ids(path: &Path) -> Result<Vec<u64>> {
         .chunks_exact(8)
         .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
         .collect())
-}
-
-/// Region-restricted searcher over a partitioned vault. Holds centroids in RAM
-/// and lazily mmaps region graphs on demand (only probed regions are resident).
-pub struct PartitionedSearch {
-    root: PathBuf,
-    dim: usize,
-    manifest: PartitionedManifest,
-    centroids: SpannCentroidIndex,
-    region_meta: BTreeMap<u32, RegionMeta>,
-    cache: Mutex<BTreeMap<u32, RegionHandle>>,
-}
-
-/// A reference-counted, opened region graph plus its local->global id map. Cloned
-/// out of the cache so probed regions can be searched in parallel without the lock.
-type RegionHandle = Arc<(DiskAnnSearch, Vec<u64>)>;
-
-impl PartitionedSearch {
-    pub fn open(root: &Path) -> Result<Self> {
-        let bytes = std::fs::read(root.join(MANIFEST_FILE)).map_err(|e| {
-            crate::error::sextant_error(crate::error::CALYX_INDEX_IO, e.to_string())
-        })?;
-        let manifest: PartitionedManifest = serde_json::from_slice(&bytes).map_err(|e| {
-            crate::error::sextant_error(crate::error::CALYX_INDEX_IO, e.to_string())
-        })?;
-        let centroids = SpannCentroidIndex::open(root.join(CENTROID_DIR))?;
-        let region_meta = manifest.regions.iter().map(|m| (m.id, m.clone())).collect();
-        Ok(Self {
-            root: root.to_path_buf(),
-            dim: manifest.dim,
-            region_meta,
-            centroids,
-            manifest,
-            cache: Mutex::new(BTreeMap::new()),
-        })
-    }
-
-    pub fn manifest(&self) -> &PartitionedManifest {
-        &self.manifest
-    }
-
-    /// Number of region graphs touched by a query is at most `n_probe` — the
-    /// proof that search cost scales with region size, not N.
-    pub fn search(
-        &self,
-        query: &[f32],
-        k: usize,
-        n_probe: usize,
-        region_beam: usize,
-    ) -> Result<Vec<(u64, f32)>> {
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-        let regions = self.centroids.nearest_centroids(query, n_probe.max(1));
-        let sp = DiskAnnSearchParams {
-            beamwidth: region_beam.max(k),
-            ef_search: region_beam.max(k),
-            rescore_k: region_beam.max(k),
-            rescore_from_raw: false,
-        };
-        // Open (or fetch from cache) every probed region's graph under the lock,
-        // cloning out reference-counted handles so the actual graph searches run
-        // WITHOUT holding the cache lock — and in parallel (the probed regions are
-        // independent, so per-query latency tracks the slowest single region, not
-        // their sum). This is the main lever that brings p99 under the SLO.
-        let mut handles: Vec<RegionHandle> = Vec::with_capacity(regions.len());
-        {
-            let mut cache = self.cache.lock().expect("partitioned cache poisoned");
-            for region in regions {
-                let Some(meta) = self.region_meta.get(&region) else {
-                    continue;
-                };
-                if let std::collections::btree_map::Entry::Vacant(slot) = cache.entry(region) {
-                    let ids = read_ids(&self.root.join(&meta.ids_rel))?;
-                    let search = DiskAnnSearch::open(
-                        SlotId::new(0),
-                        self.root.join(&meta.graph_rel),
-                        ids.iter().map(|&i| cx(i)).collect(),
-                        None,
-                        sp,
-                    )?;
-                    slot.insert(Arc::new((search, ids)));
-                }
-                handles.push(cache.get(&region).expect("just inserted").clone());
-            }
-        }
-        let per_region: Vec<Vec<(u64, f32)>> = handles
-            .par_iter()
-            .map(|handle| -> Result<Vec<(u64, f32)>> {
-                let (search, ids) = handle.as_ref();
-                let mut local = Vec::with_capacity(k);
-                for (pos, dist) in search.search_ids(query, k, &sp)? {
-                    if let Some(&global) = ids.get(pos as usize) {
-                        local.push((global, dist));
-                    }
-                }
-                Ok(local)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut hits: Vec<(u64, f32)> = per_region.into_iter().flatten().collect();
-        hits.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        hits.dedup_by_key(|(id, _)| *id);
-        hits.truncate(k);
-        Ok(hits)
-    }
-
-    pub fn dim(&self) -> usize {
-        self.dim
-    }
 }
 
 #[cfg(test)]
