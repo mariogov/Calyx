@@ -5,8 +5,29 @@ pub(crate) fn print_usage() {
 }
 
 pub(crate) fn usage() -> &'static str {
-    "usage: calyx readback (--hex <file> | --vault-tree <dir> | --vault <dir> --verify-against <sqlite.db> | --vault <dir> --show-manifest | vault-manifest --field <name> --vault <dir> | temporal_search --explain --clock-fixed <secs> --tz-offset <secs> | dedup-check --vault <dir> --cx-id <cx> --slot <n> --tau <f> --near-cos <f> --distinct-cos <f> --vault-id <id> --salt <s> | kernel-health --root <dir> --kernel-id <cx> | recurrence-series --vault <dir> --cx-id <cx> | periodic-recall --vault <dir> (--hour <0-23> | --day <0-6>) [--hour <0-23>] [--day <0-6>] | oracle_self_consistency --vault <dir> --domain <domain> --vault-id <id> --salt <s> | oracle_sufficiency --vault <dir> --fixture <json> --vault-id <id> --salt <s> | oracle_predict --vault <dir> --fixture <json> --vault-id <id> --salt <s> | oracle_expand --vault <dir> --fixture <json> --vault-id <id> --salt <s> [--depth <0-4>] | reverse_query --vault <dir> --domain <domain> --answer <text> --fixture <json> --vault-id <id> --salt <s> | super_intelligence --vault <dir> --domain <domain> --fixture <json> --vault-id <id> --salt <s> | temporal-log-recurrence --log <csv> --vault <dir> --out <json> --rows <n> --expected-cadence-secs <secs> --confidence-ceiling <f> | time-prediction --vault <dir> --cx-id <cx> --confidence-ceiling <f> | assay-report|temporal-cross-term|kernel-weights|kernel-window|ward-novelty|compression-ratio|compression-report|anneal-schedule --artifact <json> [--field <path>] | config <tripwire|budget> --vault <dir> | ledger --kind Anneal --action <GoodhartPassed|GoodhartFailed> --last <n> --vault <dir> | anneal mistakes --vault <dir> --last <n> | dedup-audit --vault <dir> --cx-id <cx> | dedup-undo --vault <dir> --token <json> | cx-list --vault <dir> | time-index --vault <dir> | as-of --vault <dir> --t-millis <ms> | --cf <name> --vault <dir> [--seq <n>] | --cf <name> --level <dir> | --wal --vault <dir>)
+    "usage: calyx readback (--hex <file> | --vault-tree <dir> | --cf-row <vault> --cf <cf-name> --key <hex-key> | --wal <segment-path> | --ledger <vault> --seq <n> | --vault <dir> --verify-against <sqlite.db> | --vault <dir> --show-manifest | vault-manifest --field <name> --vault <dir> | temporal_search --explain --clock-fixed <secs> --tz-offset <secs> | dedup-check --vault <dir> --cx-id <cx> --slot <n> --tau <f> --near-cos <f> --distinct-cos <f> --vault-id <id> --salt <s> | kernel-health --root <dir> --kernel-id <cx> | recurrence-series --vault <dir> --cx-id <cx> | periodic-recall --vault <dir> (--hour <0-23> | --day <0-6>) [--hour <0-23>] [--day <0-6>] | oracle_self_consistency --vault <dir> --domain <domain> --vault-id <id> --salt <s> | oracle_sufficiency --vault <dir> --fixture <json> --vault-id <id> --salt <s> | oracle_predict --vault <dir> --fixture <json> --vault-id <id> --salt <s> | oracle_expand --vault <dir> --fixture <json> --vault-id <id> --salt <s> [--depth <0-4>] | reverse_query --vault <dir> --domain <domain> --answer <text> --fixture <json> --vault-id <id> --salt <s> | super_intelligence --vault <dir> --domain <domain> --fixture <json> --vault-id <id> --salt <s> | temporal-log-recurrence --log <csv> --vault <dir> --out <json> --rows <n> --expected-cadence-secs <secs> --confidence-ceiling <f> | time-prediction --vault <dir> --cx-id <cx> --confidence-ceiling <f> | assay-report|temporal-cross-term|kernel-weights|kernel-window|ward-novelty|compression-ratio|compression-report|anneal-schedule --artifact <json> [--field <path>] | config <tripwire|budget> --vault <dir> | ledger --kind Anneal --action <GoodhartPassed|GoodhartFailed> --last <n> --vault <dir> | anneal mistakes --vault <dir> --last <n> | dedup-audit --vault <dir> --cx-id <cx> | dedup-undo --vault <dir> --token <json> | cx-list --vault <dir> | time-index --vault <dir> | as-of --vault <dir> --t-millis <ms> | --cf <name> --vault <dir> [--seq <n>] | --cf <name> --level <dir> | --wal --vault <dir>)
        calyx resource-status --vault <dir> [--metrics]
+       calyx create-vault <name> [--panel-template <text-default|code-default|civic-default|legal-default|medical-default|bio-default|media-default>]
+       calyx add-lens <vault> --name <n> --runtime <algorithmic|tei-http|external-cmd|candle-local|onnx|multimodal-adapter> [--endpoint <url-or-runtime-id>] [--weights <path>] [--shape Dense(<dim>)|Sparse(<dim>)] [--modality <text|code|image|audio|video|structured|mixed>]
+       calyx retire-lens <vault> --slot <u16>
+       calyx park-lens <vault> --slot <u16>
+       calyx list-panel <vault>
+       calyx profile-lens [--name <n>] [--runtime <r>] [--endpoint <url-or-runtime-id>] [--weights <path>] [--shape Dense(<dim>)|Sparse(<dim>)] [--modality <m>] [--probe <path>]
+       calyx ingest <vault> (--text <s> | --batch <jsonl-path>) [--idempotent]
+       calyx anchor <vault> <cx_id> --kind <test-pass|thumbs-up|thumbs-down|label:<s>|speaker-match|style-hold> --value <v> [--confidence <0..1>] [--source <s>]
+       calyx measure <vault> --text <s>
+       calyx search <vault> <query> [--k <n>] [--fusion <rrf|weighted-rrf|single-lens|kernel-first|pipeline>] [--guard <off|in-region>] [--explain] [--provenance|--no-provenance] [--fresh|--stale-ok] [--filter <json-predicate>]
+       calyx kernel-answer <vault> <query> [--anchor <kind>] [--explain]
+       calyx bits <vault> <anchor-kind> [--explain]
+       calyx kernel <vault> [--anchor <kind>] [--rebuild]
+       calyx guard <vault> <calibrate|check|generate> [args]
+       calyx abundance <vault>
+       calyx propose-lens <vault> --anchor <kind>
+       calyx provenance <vault> <cx_id>
+       calyx verify-chain <vault> [--from <seq>] [--to <seq>]
+       calyx reproduce <vault> <answer_id>
+       calyx anneal-status <vault>
+       calyx healthcheck [--vault <vault>] [--json|--no-json] [--tei <http://host:port[/path]>]
        calyx resource-drill --vault <dir> --ops <n> --value-bytes <n> --memtable-cap <bytes> --pin-max-age-ms <ms>
        calyx migrate vault <sqlite.db> <vault.calyx> [--verify] [--backfill-default-panel] [--offline-backfill] [--batch-size <n>]
        calyx migrate backfill <sqlite.db> <vault.calyx> [--offline-backfill] [--batch-size <n>]
@@ -18,6 +39,10 @@ pub(crate) fn usage() -> &'static str {
        calyx lens add --manifest <manifest.json> [--home <dir>]
        calyx lens list [--home <dir>]
        calyx anneal status --health --vault <dir>
+       calyx build-bench-vault --vault <dir> --n-cx <n> --dim <n> --slots <n> --seed <n>
+       calyx bench search --vault <dir> --strategy KernelFirst --n <n> --report p50,p99,p999 --seed <n> [--k <n>] [--beamwidth <n>] [--posting-cutoff <n>] [--tuner-slo-us <us>]
+       calyx bench recall --vault <dir> --n <n> --k <n> [--seed <n>]
+       calyx anneal status --vault <dir> --tuner bw_postcutoff
        calyx anneal replay-status --vault <dir>
        calyx anneal head-status --kind <Predictor|Calibrator|FusionWeights> --vault <dir>
        calyx anneal bandit-status --key <shape_key> --vault <dir>

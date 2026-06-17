@@ -3,26 +3,52 @@
 use calyx_core::{CxId, Result, SlotId, SlotShape, SlotVector};
 use serde::{Deserialize, Serialize};
 
+pub mod autotune;
 pub mod bm25;
 pub mod diskann;
 pub mod dual;
+pub mod funnel;
 pub mod hnsw;
 pub mod inverted;
 pub mod multi;
+pub mod partitioned;
 pub mod quant_config;
+pub mod spann;
+#[doc(hidden)]
+pub mod testutil;
 pub mod tokenizer;
 
+pub use autotune::{
+    BwPostcutoffAnnealRegistry, BwPostcutoffConfig, BwPostcutoffTuner, TuneDirection,
+    TunerAdjustment, TunerAdjustmentKind, TunerConfig, TunerLedgerEntry, TunerObservation,
+    TunerRange, TunerWarning, register_with_anneal,
+};
 pub use diskann::{
-    ConcatCrossTermDiskAnn, ConcatCrossTermHit, ConcatCrossTermKey, DiskAnnBuildParams,
-    DiskAnnGraphReader, DiskAnnGraphWriter, DiskAnnHeader, DiskAnnNodeRef, DiskAnnSearch,
-    DiskAnnSearchParams, TokenDiskAnnMaxSim, build_diskann_graph, node_block_size,
-    open_diskann_graph,
+    ConcatCrossTermDiskAnn, ConcatCrossTermHit, ConcatCrossTermKey, Direction, DirectionalBoost,
+    DiskAnnBuildParams, DiskAnnGraphReader, DiskAnnGraphWriter, DiskAnnHeader, DiskAnnNodeRef,
+    DiskAnnSearch, DiskAnnSearchParams, DualDiskAnnSearch, TokenDiskAnnMaxSim, build_diskann_graph,
+    build_dual, build_dual_with_search, dual_graph_path, node_block_size, open_diskann_graph,
+    open_dual,
 };
 pub use dual::{DualIndex, DualSide};
+pub use funnel::{
+    FUNNEL_MIN_VAULT_SIZE, FinalCxSearch, FunnelHit, FunnelParams, FunnelPath, KernelFirstSearch,
+    KernelRegion, KernelRegionAnn, KernelRegionId, LocalCxId, RegionCandidate, RegionId,
+    RegionPartitions,
+};
 pub use hnsw::HnswIndex;
 pub use inverted::InvertedIndex;
 pub use multi::MaxSimIndex;
+pub use partitioned::{
+    PartitionBuildParams, PartitionedManifest, PartitionedSearch, RegionMeta,
+    build_partitioned_vault, gen_row,
+};
 pub use quant_config::{QuantConfig, QuantKind, QuantizedVector};
+pub use spann::{
+    PostingListReader, PostingListWriter, SPANN_CENTROID_MAGIC, SpannCentroidIndex, SpannSearch,
+    build_centroids,
+};
+pub use testutil::{SyntheticVault, build_synthetic_vault, synthetic_dense_rows};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndexSearchHit {

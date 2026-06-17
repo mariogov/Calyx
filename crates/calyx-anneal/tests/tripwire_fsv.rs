@@ -9,7 +9,7 @@ use calyx_anneal::{
 use serde_json::json;
 
 #[test]
-#[ignore = "requires CALYX_ISSUE394_FSV_ROOT on gpuhost"]
+#[ignore = "requires CALYX_ISSUE394_FSV_ROOT on aiwonder"]
 fn issue394_tripwire_registry_fsv() {
     let root =
         PathBuf::from(env::var("CALYX_ISSUE394_FSV_ROOT").expect("set CALYX_ISSUE394_FSV_ROOT"));

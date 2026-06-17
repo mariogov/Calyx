@@ -138,7 +138,7 @@ fn inactive_high_bit_slot_is_not_required() {
 }
 
 #[test]
-#[ignore = "manual gpuhost FSV fixture; set CALYX_WARD_REQUIRED_FSV_DIR"]
+#[ignore = "manual aiwonder FSV fixture; set CALYX_WARD_REQUIRED_FSV_DIR"]
 fn required_slots_fsv_fixture_writes_readback_artifacts() {
     let root = std::env::var("CALYX_WARD_REQUIRED_FSV_DIR")
         .expect("CALYX_WARD_REQUIRED_FSV_DIR is required");
