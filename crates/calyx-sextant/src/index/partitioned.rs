@@ -35,10 +35,11 @@ use rayon::{ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 
 use crate::index::{
-    DiskAnnBuildParams, DiskAnnSearch, DiskAnnSearchParams, SpannCentroidIndex, build_centroids,
+    DiskAnnBuildBackend, DiskAnnBuildParams, DiskAnnSearch, DiskAnnSearchParams,
+    SpannCentroidIndex, build_centroids,
 };
 use assignment::{
-    AssignmentRouting, AssignmentSink, read_ids, stream_assign_to_ids,
+    AssignmentRouting, AssignmentSink, read_ids, stream_assign_to_ids_bounded,
     stream_assign_to_ids_with_routing,
 };
 use balance::balance_region_files;
@@ -52,6 +53,10 @@ const IDX_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 /// Floor for the per-region size cap used by region balancing (#713); regions are
 /// never split below this even when the mean region size is tiny.
 const MIN_REGION_CAP: usize = 2_048;
+/// Final assignment only places a row into one of the regions the routing layer
+/// can return at normal low-probe search settings. If those regions are full, the
+/// build fails closed instead of hiding an unreachable assignment.
+const FINAL_ASSIGNMENT_PROBE: usize = 32;
 
 /// Deterministic, per-index row generation. Independent of any other index, so
 /// rows can be streamed/regenerated per region without materializing `0..idx`.
@@ -102,9 +107,15 @@ pub struct PartitionedManifest {
     pub ef_construction: usize,
     #[serde(default)]
     pub region_build_parallelism: usize,
+    #[serde(default = "default_graph_build_backend")]
+    pub graph_build_backend: DiskAnnBuildBackend,
     pub centroids_rel: String,
     pub root_graph_rel: String,
     pub regions: Vec<RegionMeta>,
+}
+
+fn default_graph_build_backend() -> DiskAnnBuildBackend {
+    DiskAnnBuildBackend::CpuVamana
 }
 
 /// Parameters for a partitioned build.
@@ -231,6 +242,14 @@ pub fn build_partitioned_vault(
     root: &Path,
     p: PartitionBuildParams,
 ) -> Result<PartitionedManifest> {
+    build_partitioned_vault_with_backend(root, p, DiskAnnBuildBackend::CpuVamana)
+}
+
+pub fn build_partitioned_vault_with_backend(
+    root: &Path,
+    p: PartitionBuildParams,
+    backend: DiskAnnBuildBackend,
+) -> Result<PartitionedManifest> {
     if p.n_cx == 0 || p.dim == 0 || p.n_regions == 0 {
         return Err(crate::error::sextant_error(
             crate::error::CALYX_INDEX_INVALID_PARAMS,
@@ -242,7 +261,7 @@ pub fn build_partitioned_vault(
         dim: p.dim,
         n_cx: p.n_cx,
     };
-    build_partitioned_vault_from_source(root, &source, p)
+    build_partitioned_vault_from_source_with_backend(root, &source, p, backend)
 }
 
 /// Build the partitioned vault under `root` from REAL vectors in `source`.
@@ -253,6 +272,20 @@ pub fn build_partitioned_vault_from_source(
     root: &Path,
     source: &dyn VectorSource,
     p: PartitionBuildParams,
+) -> Result<PartitionedManifest> {
+    build_partitioned_vault_from_source_with_backend(
+        root,
+        source,
+        p,
+        DiskAnnBuildBackend::CpuVamana,
+    )
+}
+
+pub fn build_partitioned_vault_from_source_with_backend(
+    root: &Path,
+    source: &dyn VectorSource,
+    p: PartitionBuildParams,
+    backend: DiskAnnBuildBackend,
 ) -> Result<PartitionedManifest> {
     let dim = source.dim();
     let n_cx = source.len();
@@ -323,14 +356,23 @@ pub fn build_partitioned_vault_from_source(
         SpannCentroidIndex::from_parts(dim as u32, final_centroids, Vec::new(), Vec::new())?;
     centroids.save(root.join(CENTROID_DIR))?;
 
-    // 2c. Re-assign every cx against the FINAL centroids through the EXACT routing a
-    //     query uses (`assign_hnsw` == `nearest_centroids` top-1), and spool that
-    //     compact region->cx mapping directly to per-region `.ids` files. These files
-    //     are the build source of truth: graph construction reads them back instead of
-    //     holding final buckets in heap, and interrupted builds leave restartable
-    //     assignment files behind (#709/#711).
-    let region_ids =
-        stream_assign_to_ids(root, AssignmentSink::Final, &centroids, source, p.chunk)?;
+    // 2c. Re-assign every cx against the FINAL centroids, but keep the result
+    //     capacity-bounded. Plain nearest-centroid rebucketing can merge split
+    //     sub-centroids back into a huge natural cell, recreating the #713 build
+    //     tail. Bounded assignment chooses the nearest still-open routed centroid
+    //     from the normal low-probe candidate set; if no routed candidate has
+    //     capacity, the build fails closed instead of creating an unreachable row.
+    let final_mean = (n_cx as usize).div_ceil(centroids.centroid_count().max(1));
+    let final_cap = final_mean.saturating_mul(2).max(MIN_REGION_CAP);
+    let region_ids = stream_assign_to_ids_bounded(
+        root,
+        AssignmentSink::Final,
+        &centroids,
+        source,
+        p.chunk,
+        final_cap,
+        FINAL_ASSIGNMENT_PROBE,
+    )?;
     let region_build_parallelism =
         effective_region_build_parallelism(p.region_build_parallelism, region_ids.len())?;
 
@@ -381,13 +423,14 @@ pub fn build_partitioned_vault_from_source(
                     .map(|&idx| (cx(idx), source.row(idx)))
                     .collect();
                 let graph_path = root.join(graph_rel(region));
-                DiskAnnSearch::build_without_default_raw_sidecar(
+                DiskAnnSearch::build_without_default_raw_sidecar_with_backend(
                     SlotId::new(0),
                     &graph_path,
                     &rows,
                     build_params,
                     None,
                     search_params,
+                    backend,
                 )?;
                 Ok(RegionMeta {
                     id: region,
@@ -410,13 +453,14 @@ pub fn build_partitioned_vault_from_source(
         .enumerate()
         .map(|(i, c)| (cx(i as u64), c.clone()))
         .collect();
-    DiskAnnSearch::build_without_default_raw_sidecar(
+    DiskAnnSearch::build_without_default_raw_sidecar_with_backend(
         SlotId::new(0),
         root.join(ROOT_GRAPH),
         &centroid_rows,
         build_params,
         None,
         search_params,
+        backend,
     )?;
 
     let manifest = PartitionedManifest {
@@ -428,6 +472,7 @@ pub fn build_partitioned_vault_from_source(
         m_max: p.m_max,
         ef_construction: p.ef_construction,
         region_build_parallelism,
+        graph_build_backend: backend,
         centroids_rel: format!("{CENTROID_DIR}/centroids.spn"),
         root_graph_rel: ROOT_GRAPH.to_string(),
         regions,
