@@ -19,8 +19,18 @@ pub(crate) struct CorpusBuildEvidence {
     pub(crate) vectors_path: String,
     pub(crate) cost_path: String,
     pub(crate) n_samples: usize,
+    pub(crate) batch_size: usize,
     pub(crate) label_counts: BTreeMap<String, usize>,
+    pub(crate) temporal: TemporalEvidence,
     pub(crate) lenses: Vec<LensEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct TemporalEvidence {
+    pub(crate) active_rows: usize,
+    pub(crate) inactive_rows: usize,
+    pub(crate) source_sequence: String,
+    pub(crate) accepted_fields: Vec<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -30,6 +40,8 @@ pub(crate) struct LensEvidence {
     pub(crate) output_shape: String,
     pub(crate) assay_projection: String,
     pub(crate) manifest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_batch: Option<usize>,
     pub(crate) vram_mb: f32,
     pub(crate) ram_mb: f32,
     pub(crate) ms_per_input: f32,
@@ -85,7 +97,9 @@ fn write_all_files(
         vectors_path: display_final(request, "vectors.jsonl"),
         cost_path: display_final(request, "cost.json"),
         n_samples: rows.rows.len(),
+        batch_size: request.batch_size,
         label_counts: rows.label_counts.clone(),
+        temporal: temporal_evidence(rows),
         lenses: lenses.iter().map(lens_evidence).collect(),
     };
     fs::write(
@@ -113,6 +127,7 @@ fn write_manifest(
         "n_samples": rows.rows.len(),
         "label_counts": rows.label_counts,
         "target_class": request.target_class,
+        "temporal": temporal_evidence(rows),
         "lenses": manifest_lenses
     });
     fs::write(
@@ -134,12 +149,38 @@ fn write_vectors(rows: &BuildRows, lenses: &[MeasuredLens], path: &Path) -> Resu
             "id": row.id,
             "split": row.split,
             "label": row.label,
+            "source_event_time_secs": row.event_time_secs,
+            "source_event_time_raw": row.event_time_raw,
+            "temporal_lane_state": row.temporal_lane_state,
+            "temporal_inactive_reason": row.temporal_inactive_reason,
+            "source_sequence": row.source_sequence,
+            "source_sequence_index": row.source_sequence_index,
             "lenses": lens_map
         });
         serde_json::to_writer(&mut writer, &line).map_err(json_error)?;
         writer.write_all(b"\n").map_err(io_error)?;
     }
     writer.flush().map_err(io_error)
+}
+
+fn temporal_evidence(rows: &BuildRows) -> TemporalEvidence {
+    let active_rows = rows
+        .rows
+        .iter()
+        .filter(|row| row.event_time_secs.is_some())
+        .count();
+    TemporalEvidence {
+        active_rows,
+        inactive_rows: rows.rows.len().saturating_sub(active_rows),
+        source_sequence: "jsonl_line".to_string(),
+        accepted_fields: vec![
+            "event_time",
+            "event_time_secs",
+            "source_event_time_secs",
+            "created_at",
+            "timestamp",
+        ],
+    }
 }
 
 fn write_cost(lenses: &[MeasuredLens], path: &Path) -> Result<(), String> {
@@ -177,6 +218,7 @@ fn lens_evidence(lens: &MeasuredLens) -> LensEvidence {
         output_shape: shape_text(lens.output),
         assay_projection: lens.assay_projection.to_string(),
         manifest: display(&lens.manifest),
+        max_batch: lens.max_batch,
         vram_mb: lens.cost.vram_mb,
         ram_mb: lens.cost.ram_mb,
         ms_per_input: lens.cost.ms_per_input,

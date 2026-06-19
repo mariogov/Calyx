@@ -42,6 +42,7 @@ pub(crate) fn usage() -> &'static str {
        calyx lens explain --manifest <manifest.json> [--input <text>|--input-file <path>] [--repeat <n>] [--full-vector]
        calyx assay corpus-build --rows-jsonl <rows.jsonl> --out-dir <dir> --dataset <name> --target-class <n> --manifest <manifest.json> --manifest <manifest.json> [--limit-per-class <n>] [--batch-size <n>] [--cost-override-json <json>]
        calyx assay export-fbin --corpus-dir <dir> --out-dir <dir> --bits-report <assay_abundance.json> --query-count <n> [--min-bits <f>]
+       calyx assay stream-fbin --rows-jsonl <rows.jsonl> --out-dir <dir> --dataset <name> --target-class <n> --bits-report <assay_abundance.json> --query-count <n> --manifest <manifest.json> [--manifest <manifest.json> ...] [--limit-per-class <n>] [--batch-size <n>] [--cost-override-json <json>] [--min-bits <f>]
        calyx fsv corpus-readback --root <dir>
        calyx anneal status --health --vault <dir>
        calyx build-bench-vault --vault <dir> --n-cx <n> --dim <n> --slots <n> --seed <n>
@@ -50,7 +51,8 @@ pub(crate) fn usage() -> &'static str {
        calyx bench recall --vault <dir> --n <n> --k <n> [--seed <n>]
        calyx bench partitioned-search --vault <dir> --n <n> --k <n> --n-probe <n> --region-beam <n> [--ground-truth <n> --recall-floor <f>]
        calyx bench partitioned-search --vault <dir> --queries <file.fbin|file.i8bin> [--corpus <file.fbin|file.i8bin>|--ground-truth-file <file.i32bin> [--ground-truth-id-map <file.i32bin>]] --n <n> --k <n> --n-probe <n> --region-beam <n> --ground-truth <n> --recall-floor <f>
-       calyx bench partitioned-rrf --plan <json> --n <n> --k <n> --n-probe <n> --region-beam <n> --ground-truth <n> [--truth-depth <n>] [--recall-floor <f>] [--out <json>]
+       calyx bench partitioned-rrf --plan <json> --n <n> --k <n> --n-probe <n> --region-beam <n> --ground-truth <n> [--truth-depth <n>] [--fused-ground-truth-file <i32bin> --fused-ground-truth-manifest <json>|--slot-ground-truth-manifest <json>] [--write-fused-ground-truth-file <i32bin> --write-fused-ground-truth-manifest <json>] [--recall-floor <f>] [--out <json>] [--anneal-vault <dir>] [--tuner-slo-us <us>]
+       calyx bench partitioned-rrf-slot-truth --plan <json> --out-dir <dir> --query-count <n> --truth-depth <n> [--chunk-rows <n>]
        calyx anneal status --vault <dir> --tuner bw_postcutoff
        calyx anneal replay-status --vault <dir>
        calyx anneal head-status --kind <Predictor|Calibrator|FusionWeights> --vault <dir>

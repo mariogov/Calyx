@@ -16,12 +16,18 @@ use crate::lens_commands::support::{dim, runtime_name, validate_vector_contract}
 use super::data::BuildRows;
 use super::request::CorpusBuildRequest;
 
+mod progress;
+mod stream;
+
+pub(crate) use stream::measure_text_batch;
+
 #[derive(Clone, Debug)]
 pub(crate) struct MeasuredLens {
     pub(crate) name: String,
     pub(crate) manifest: PathBuf,
     pub(crate) runtime: String,
     pub(crate) output: SlotShape,
+    pub(crate) max_batch: Option<usize>,
     pub(crate) assay_projection: &'static str,
     pub(crate) vectors: Vec<Vec<f32>>,
     pub(crate) cost: LensCost,
@@ -92,6 +98,7 @@ pub(crate) fn measure_lenses(
             .iter()
             .map(|row| Input::new(lens.spec.modality, row.text.as_bytes().to_vec()))
             .collect::<Vec<_>>();
+        progress::emit_start(request, rows, &lens);
         let started = Instant::now();
         let slots = measure_batches(&lens, &inputs, request.batch_size)?;
         let total_ms = started.elapsed().as_secs_f64() as f32 * 1000.0;
@@ -104,11 +111,13 @@ pub(crate) fn measure_lenses(
         }
         let (vectors, assay_projection) = assay_vectors(&lens, slots)?;
         let cost = lens_cost(&lens, overrides.get(&lens.name).copied(), ms_per_input)?;
+        progress::emit_finish(request, rows, &lens, total_ms, &cost);
         measured.push(MeasuredLens {
             name: lens.name,
             manifest: lens.manifest,
             runtime: lens.runtime_name,
             output: lens.spec.output,
+            max_batch: lens.spec.max_batch,
             assay_projection,
             vectors,
             cost,
@@ -135,16 +144,16 @@ fn build_lens(manifest: PathBuf, spec: RegistryLensSpec) -> Result<BuildLens, St
         }
         LensRuntime::Onnx { files, .. } => {
             let lens = OnnxLens::from_lens_spec(&spec).map_err(lens_error)?;
-            let ram_mb = paths_mb(&files)?;
+            let vram_mb = paths_mb(&files)?;
             Ok(BuildLens {
                 name: spec.name.clone(),
                 manifest,
                 spec,
                 runtime_name: runtime,
                 lens: Box::new(lens),
-                placement: Placement::Cpu,
-                default_vram_mb: 0.0,
-                default_ram_mb: ram_mb,
+                placement: Placement::Gpu,
+                default_vram_mb: vram_mb,
+                default_ram_mb: 0.0,
             })
         }
         LensRuntime::StaticLookup {
@@ -338,13 +347,16 @@ fn lens_cost(
     ms_per_input: f32,
 ) -> Result<LensCost, String> {
     let basis = match override_cost {
-        Some(cost) => RuntimeCostBasis {
-            name: &lens.name,
-            runtime: &lens.runtime_name,
-            placement: cost.placement,
-            vram_mb: cost.vram_mb,
-            ram_mb: cost.ram_mb,
-        },
+        Some(cost) => {
+            validate_override_compatible(&lens.name, &lens.runtime_name, lens.placement, cost)?;
+            RuntimeCostBasis {
+                name: &lens.name,
+                runtime: &lens.runtime_name,
+                placement: cost.placement,
+                vram_mb: cost.vram_mb,
+                ram_mb: cost.ram_mb,
+            }
+        }
         None if lens.default_vram_mb.is_finite() => RuntimeCostBasis {
             name: &lens.name,
             runtime: &lens.runtime_name,
@@ -366,6 +378,21 @@ fn lens_cost(
         ram_mb: basis.ram_mb,
         ms_per_input,
     })
+}
+
+fn validate_override_compatible(
+    lens_name: &str,
+    runtime_name: &str,
+    default_placement: Placement,
+    cost: CostOverride,
+) -> Result<(), String> {
+    if default_placement == Placement::Gpu && cost.placement != Placement::Gpu {
+        return Err(format!(
+            "CALYX_FSV_ASSAY_CORPUS_BUILD_GPU_OVERRIDE_PLACEMENT: lens={lens_name} runtime={runtime_name} override placement={:?} but GPU runtimes must remain gpu",
+            cost.placement
+        ));
+    }
+    Ok(())
 }
 
 fn load_cost_overrides(
@@ -436,4 +463,36 @@ fn file_len(path: &Path) -> Result<u64, String> {
 
 fn lens_error(error: calyx_core::CalyxError) -> String {
     format!("{}: {}", error.code, error.message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_runtime_override_cannot_downgrade_to_cpu() {
+        let cost = CostOverride {
+            placement: Placement::Cpu,
+            vram_mb: 0.0,
+            ram_mb: 128.0,
+        };
+
+        let error = validate_override_compatible("semantic-bge", "onnx", Placement::Gpu, cost)
+            .expect_err("GPU runtime override must not become CPU");
+
+        assert!(error.contains("CALYX_FSV_ASSAY_CORPUS_BUILD_GPU_OVERRIDE_PLACEMENT"));
+        assert!(error.contains("runtime=onnx"));
+    }
+
+    #[test]
+    fn cpu_runtime_override_can_remain_cpu() {
+        let cost = CostOverride {
+            placement: Placement::Cpu,
+            vram_mb: 0.0,
+            ram_mb: 128.0,
+        };
+
+        validate_override_compatible("semantic-potion", "static_lookup", Placement::Cpu, cost)
+            .expect("CPU-native override can remain CPU");
+    }
 }

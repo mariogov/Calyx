@@ -1,6 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::Write;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -13,12 +11,23 @@ use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::brute_force::brute_force_topk_vecfile_ranked;
 use super::{enforce_recall_floor, percentiles, row_for_metric};
 use crate::error::{CliError, CliResult};
 
 #[path = "multi_rrf/a35.rs"]
 mod a35;
+#[path = "multi_rrf/ground_truth.rs"]
+mod ground_truth;
+#[path = "multi_rrf/io.rs"]
+mod io;
+#[path = "multi_rrf/recall.rs"]
+mod recall;
+#[path = "multi_rrf/slot_truth.rs"]
+mod slot_truth;
+#[path = "multi_rrf/timeline.rs"]
+mod timeline;
+#[path = "multi_rrf/tuner.rs"]
+mod tuner;
 
 const DEFAULT_TRUTH_DEPTH: usize = 64;
 
@@ -32,11 +41,20 @@ struct Args {
     ground_truth: usize,
     recall_floor: Option<f32>,
     truth_depth: Option<usize>,
+    fused_ground_truth_file: Option<PathBuf>,
+    fused_ground_truth_manifest: Option<PathBuf>,
+    slot_ground_truth_manifest: Option<PathBuf>,
+    write_fused_ground_truth_file: Option<PathBuf>,
+    write_fused_ground_truth_manifest: Option<PathBuf>,
     out: Option<PathBuf>,
+    anneal_vault: Option<PathBuf>,
+    tuner_slo_us: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct Plan {
+    #[serde(default)]
+    timeline: Option<PathBuf>,
     slots: Vec<PlanSlot>,
 }
 
@@ -66,7 +84,14 @@ impl Args {
         let mut ground_truth = 0;
         let mut recall_floor = None;
         let mut truth_depth = None;
+        let mut fused_ground_truth_file = None;
+        let mut fused_ground_truth_manifest = None;
+        let mut slot_ground_truth_manifest = None;
+        let mut write_fused_ground_truth_file = None;
+        let mut write_fused_ground_truth_manifest = None;
         let mut out = None;
+        let mut anneal_vault = None;
+        let mut tuner_slo_us = None;
         let mut it = raw.iter();
         while let Some(flag) = it.next() {
             let mut next = || {
@@ -83,7 +108,30 @@ impl Args {
                 "--ground-truth" => ground_truth = parse(&next()?, "--ground-truth")?,
                 "--recall-floor" => recall_floor = Some(super::parse_recall_floor(&next()?)?),
                 "--truth-depth" => truth_depth = Some(parse(&next()?, "--truth-depth")?),
+                "--fused-ground-truth-file" => {
+                    fused_ground_truth_file = Some(PathBuf::from(next()?))
+                }
+                "--fused-ground-truth-manifest" => {
+                    fused_ground_truth_manifest = Some(PathBuf::from(next()?))
+                }
+                "--slot-ground-truth-manifest" => {
+                    slot_ground_truth_manifest = Some(PathBuf::from(next()?))
+                }
+                "--write-fused-ground-truth-file" => {
+                    write_fused_ground_truth_file = Some(PathBuf::from(next()?))
+                }
+                "--write-fused-ground-truth-manifest" => {
+                    write_fused_ground_truth_manifest = Some(PathBuf::from(next()?))
+                }
                 "--out" => out = Some(PathBuf::from(next()?)),
+                "--anneal-vault" => anneal_vault = Some(PathBuf::from(next()?)),
+                "--tuner-slo-us" => {
+                    let value = parse(&next()?, "--tuner-slo-us")?;
+                    if value == 0 {
+                        return Err(CliError::usage("--tuner-slo-us must be > 0"));
+                    }
+                    tuner_slo_us = Some(value);
+                }
                 other => return Err(CliError::usage(format!("unknown flag: {other}"))),
             }
         }
@@ -91,6 +139,13 @@ impl Args {
         if k == 0 {
             return Err(CliError::usage("--k must be > 0"));
         }
+        validate_truth_args(
+            fused_ground_truth_file.as_ref(),
+            fused_ground_truth_manifest.as_ref(),
+            slot_ground_truth_manifest.as_ref(),
+            write_fused_ground_truth_file.as_ref(),
+            write_fused_ground_truth_manifest.as_ref(),
+        )?;
         Ok(Self {
             plan,
             n,
@@ -100,9 +155,46 @@ impl Args {
             ground_truth,
             recall_floor,
             truth_depth,
+            fused_ground_truth_file,
+            fused_ground_truth_manifest,
+            slot_ground_truth_manifest,
+            write_fused_ground_truth_file,
+            write_fused_ground_truth_manifest,
             out,
+            anneal_vault,
+            tuner_slo_us,
         })
     }
+}
+
+fn validate_truth_args(
+    fused_file: Option<&PathBuf>,
+    fused_manifest: Option<&PathBuf>,
+    slot_manifest: Option<&PathBuf>,
+    write_file: Option<&PathBuf>,
+    write_manifest: Option<&PathBuf>,
+) -> CliResult {
+    if fused_file.is_some() != fused_manifest.is_some() {
+        return Err(CliError::usage(
+            "--fused-ground-truth-file requires --fused-ground-truth-manifest",
+        ));
+    }
+    if write_file.is_some() != write_manifest.is_some() {
+        return Err(CliError::usage(
+            "--write-fused-ground-truth-file requires --write-fused-ground-truth-manifest",
+        ));
+    }
+    if fused_file.is_some() && write_file.is_some() {
+        return Err(CliError::usage(
+            "precomputed and generated fused ground truth are mutually exclusive in one run",
+        ));
+    }
+    if fused_file.is_some() && slot_manifest.is_some() {
+        return Err(CliError::usage(
+            "--fused-ground-truth-file and --slot-ground-truth-manifest are mutually exclusive",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn run(raw: &[String]) -> CliResult {
@@ -113,11 +205,55 @@ pub(crate) fn run(raw: &[String]) -> CliResult {
     let n = slots
         .iter()
         .fold(args.n, |acc, slot| acc.min(slot.queries.count() as usize));
+    let corpus_rows = slots
+        .iter()
+        .fold(u64::MAX, |acc, slot| acc.min(slot.corpus.count())) as usize;
+    let timeline = plan
+        .timeline
+        .as_ref()
+        .map(|path| {
+            timeline::Timeline::load(&timeline::resolve_plan_path(&args.plan, path), corpus_rows)
+        })
+        .transpose()?;
     let truth_n = args.ground_truth.min(n);
     let truth_depth = args
         .truth_depth
         .unwrap_or_else(|| DEFAULT_TRUTH_DEPTH.max(args.k * 8))
         .max(args.k);
+    let precomputed_truth = match (
+        args.fused_ground_truth_file.as_ref(),
+        args.fused_ground_truth_manifest.as_ref(),
+    ) {
+        (Some(file), Some(manifest)) if truth_n > 0 => Some(ground_truth::PrecomputedTruth::load(
+            ground_truth::Context {
+                truth_file: file,
+                manifest_file: manifest,
+                plan_path: &args.plan,
+                plan: &plan,
+                truth_n,
+                k: args.k,
+                truth_depth,
+                corpus_rows,
+            },
+        )?),
+        _ => None,
+    };
+    let slot_truth = match args.slot_ground_truth_manifest.as_ref() {
+        Some(manifest) if truth_n > 0 => Some(slot_truth::SlotTruth::load(slot_truth::Context {
+            manifest_file: manifest,
+            plan_path: &args.plan,
+            plan: &plan,
+            truth_n,
+            truth_depth,
+            corpus_rows,
+        })?),
+        Some(_) => {
+            return Err(CliError::usage(
+                "--slot-ground-truth-manifest requires --ground-truth > 0",
+            ));
+        }
+        None => None,
+    };
     if n == 0 {
         return Err(CliError::usage(
             "partitioned-rrf has zero query rows across plan slots",
@@ -159,26 +295,68 @@ pub(crate) fn run(raw: &[String]) -> CliResult {
             fused_hits_for_truth.push(fused_hit_ids(&fused, args.k));
         }
     }
-    let (fused_recall, per_slot_recall, best_single, sample_readback) = if truth_n > 0 {
-        recall_readback(
-            &slots,
+    let recall = if truth_n > 0 {
+        recall::readback(recall::Request {
+            slots: &slots,
             truth_n,
             truth_depth,
-            args.k,
-            &fused_hits_for_truth,
-            &single_hits_for_truth,
-        )
+            k: args.k,
+            fused_hits: &fused_hits_for_truth,
+            single_hits: &single_hits_for_truth,
+            timeline: timeline.as_ref(),
+            precomputed_truth: precomputed_truth.as_ref(),
+            slot_truth: slot_truth.as_ref(),
+        })
     } else {
-        (None, Vec::new(), None, Vec::new())
+        recall::RecallReadback::default()
     };
-    enforce_recall_floor(args.recall_floor, truth_n, fused_recall)?;
+    let written_ground_truth = match (
+        args.write_fused_ground_truth_file.as_ref(),
+        args.write_fused_ground_truth_manifest.as_ref(),
+    ) {
+        (Some(file), Some(manifest)) if truth_n > 0 => Some(ground_truth::write(
+            &recall.exact_fused_rows,
+            ground_truth::Context {
+                truth_file: file,
+                manifest_file: manifest,
+                plan_path: &args.plan,
+                plan: &plan,
+                truth_n,
+                k: args.k,
+                truth_depth,
+                corpus_rows,
+            },
+        )?),
+        _ => None,
+    };
+    enforce_recall_floor(args.recall_floor, truth_n, recall.fused_recall)?;
     let latency_us = percentiles(&fused_latencies_us);
+    let tuner_status_path = if let Some(vault) = &args.anneal_vault {
+        Some(tuner::write_status(tuner::StatusRequest {
+            vault,
+            latencies_us: &fused_latencies_us[..truth_n],
+            per_query_recall: &recall.per_query_recall,
+            region_beam: args.region_beam,
+            n_probe: args.n_probe,
+            tuner_slo_us: args.tuner_slo_us,
+            recall_floor: args.recall_floor,
+            report_path: args.out.as_deref(),
+            report_latency_us: &latency_us,
+            fused_recall: recall.fused_recall,
+            lens_count: slots.len(),
+            queries: n,
+            k: args.k,
+        })?)
+    } else {
+        None
+    };
     let report = json!({
         "trigger": "calyx bench partitioned-rrf",
         "mode": "real_multi_slot_rrf",
         "plan": args.plan,
         "lens_roster": a35::lens_roster(&slots),
         "per_lens_bits": a35::per_lens_bits(&slots),
+        "temporal": timeline.as_ref().map(|timeline| timeline.report()),
         "slots": slot_report(&slots),
         "queries": n,
         "k": args.k,
@@ -187,18 +365,21 @@ pub(crate) fn run(raw: &[String]) -> CliResult {
         "per_slot_search_depth": truth_depth,
         "truth_depth": truth_depth,
         "ground_truth_queries": truth_n,
+        "ground_truth_source": recall.ground_truth_source,
+        "written_fused_ground_truth_source": written_ground_truth,
         "latency_us": latency_us.clone(),
-        "fused_ground_truth_recall_at_k": fused_recall,
-        "fused_result": a35::fused_result(fused_recall, &latency_us, &sample_readback),
-        "best_single_lens_recall_vs_fused_truth": best_single,
-        "fusion_matches_or_beats_best_single": fused_recall.zip(best_single).map(|(fused, single)| fused + f32::EPSILON >= single),
-        "per_slot_recall_vs_fused_truth": per_slot_recall,
-        "sample_readback": sample_readback,
+        "fused_ground_truth_recall_at_k": recall.fused_recall,
+        "fused_result": a35::fused_result(recall.fused_recall, &latency_us, &recall.sample_readback),
+        "best_single_lens_recall_vs_fused_truth": recall.best_single,
+        "fusion_matches_or_beats_best_single": recall.fused_recall.zip(recall.best_single).map(|(fused, single)| fused + f32::EPSILON >= single),
+        "per_slot_recall_vs_fused_truth": recall.per_slot_recall,
+        "sample_readback": recall.sample_readback,
         "recall_floor": args.recall_floor,
+        "tuner_status_path": tuner_status_path,
     });
     let bytes = serde_json::to_vec_pretty(&report)?;
     if let Some(path) = &args.out {
-        write_bytes_atomic(path, &bytes)?;
+        io::write_bytes_atomic(path, &bytes)?;
     }
     println!("{}", String::from_utf8(bytes).expect("json is utf8"));
     Ok(())
@@ -206,7 +387,7 @@ pub(crate) fn run(raw: &[String]) -> CliResult {
 
 fn load_plan(path: &Path) -> CliResult<Plan> {
     let plan: Plan = serde_json::from_slice(&std::fs::read(path)?)?;
-    let mut seen = BTreeSet::new();
+    let mut seen = std::collections::BTreeSet::new();
     for slot in &plan.slots {
         if !seen.insert(slot.slot) {
             return Err(CliError::usage(format!(
@@ -245,91 +426,6 @@ fn open_slots(plan: &Plan) -> CliResult<Vec<OpenSlot>> {
         .collect()
 }
 
-fn recall_readback(
-    slots: &[OpenSlot],
-    truth_n: usize,
-    truth_depth: usize,
-    k: usize,
-    fused_hits: &[Vec<u64>],
-    single_hits: &BTreeMap<SlotId, Vec<Vec<u64>>>,
-) -> (
-    Option<f32>,
-    Vec<serde_json::Value>,
-    Option<f32>,
-    Vec<serde_json::Value>,
-) {
-    let mut single_found: BTreeMap<SlotId, usize> = slots
-        .iter()
-        .map(|slot| (slot_id(slot.spec.slot), 0))
-        .collect();
-    let mut fused_found = 0usize;
-    let mut total = 0usize;
-    let mut sample_readback = Vec::new();
-    for query_idx in 0..truth_n {
-        let mut exact_per_slot = BTreeMap::new();
-        let mut exact_slot_rows = Vec::new();
-        for slot in slots {
-            let query = row_for_metric(&slot.queries, query_idx as u64, slot.distance_metric);
-            let exact = brute_force_topk_vecfile_ranked(
-                &slot.corpus,
-                &[query],
-                truth_depth,
-                slot.distance_metric,
-            )
-            .pop()
-            .expect("one query");
-            exact_slot_rows.push(json!({
-                "slot": slot.spec.slot,
-                "exact_top_k": exact.iter().take(k).map(|(id, _)| *id).collect::<Vec<_>>(),
-            }));
-            exact_per_slot.insert(slot_id(slot.spec.slot), to_index_hits(exact));
-        }
-        let exact_fused = fuse(&exact_per_slot, k);
-        let exact_ids = fused_hit_ids(&exact_fused, k);
-        let truth = exact_ids.iter().copied().collect::<BTreeSet<_>>();
-        if sample_readback.len() < 3 {
-            sample_readback.push(json!({
-                "query_idx": query_idx,
-                "partitioned_fused_top_k": fused_hits[query_idx],
-                "exact_fused_top_k": exact_ids,
-                "per_slot_exact_top_k": exact_slot_rows,
-            }));
-        }
-        total += truth.len();
-        fused_found += fused_hits[query_idx]
-            .iter()
-            .filter(|id| truth.contains(id))
-            .count();
-        for (slot, rows) in single_hits {
-            let found = rows[query_idx]
-                .iter()
-                .filter(|id| truth.contains(id))
-                .count();
-            *single_found.get_mut(slot).expect("slot seeded") += found;
-        }
-    }
-    let denom = total.max(1) as f32;
-    let per_slot = single_found
-        .into_iter()
-        .map(|(slot, found)| {
-            json!({
-                "slot": slot.get(),
-                "recall_at_k": found as f32 / denom,
-            })
-        })
-        .collect::<Vec<_>>();
-    let best = per_slot
-        .iter()
-        .filter_map(|row| row["recall_at_k"].as_f64().map(|value| value as f32))
-        .max_by(f32::total_cmp);
-    (
-        Some(fused_found as f32 / denom),
-        per_slot,
-        best,
-        sample_readback,
-    )
-}
-
 fn fuse(per_slot: &BTreeMap<SlotId, Vec<IndexSearchHit>>, k: usize) -> Vec<calyx_sextant::Hit> {
     let context = FusionContext {
         k,
@@ -358,32 +454,6 @@ fn hit_ids(hits: &[IndexSearchHit], k: usize) -> Vec<u64> {
 
 fn fused_hit_ids(hits: &[calyx_sextant::Hit], k: usize) -> Vec<u64> {
     hits.iter().take(k).map(|hit| low_u64(hit.cx_id)).collect()
-}
-
-fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> CliResult {
-    if path.exists() {
-        return Err(CliError::usage(format!(
-            "--out {} already exists; remove it before re-running",
-            path.display()
-        )));
-    }
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })?;
-    Ok(())
 }
 
 fn slot_report(slots: &[OpenSlot]) -> Vec<serde_json::Value> {
@@ -422,50 +492,5 @@ fn low_u64(cx_id: CxId) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn args_parse_plan_and_truth_depth() {
-        let args = Args::parse(&strings([
-            "--plan",
-            "plan.json",
-            "--n",
-            "12",
-            "--k",
-            "4",
-            "--n-probe",
-            "3",
-            "--region-beam",
-            "32",
-            "--ground-truth",
-            "5",
-            "--truth-depth",
-            "40",
-            "--recall-floor",
-            "0.8",
-        ]))
-        .unwrap();
-
-        assert_eq!(args.plan, PathBuf::from("plan.json"));
-        assert_eq!(args.n, 12);
-        assert_eq!(args.k, 4);
-        assert_eq!(args.truth_depth, Some(40));
-        assert_eq!(args.recall_floor, Some(0.8));
-        assert_eq!(args.out, None);
-    }
-
-    #[test]
-    fn to_index_hits_preserves_rank_and_cx_id() {
-        let hits = to_index_hits(vec![(9, 0.1), (3, 0.2)]);
-
-        assert_eq!(hits[0].rank, 1);
-        assert_eq!(low_u64(hits[0].cx_id), 9);
-        assert_eq!(hits[1].rank, 2);
-        assert_eq!(low_u64(hits[1].cx_id), 3);
-    }
-
-    fn strings(items: impl IntoIterator<Item = &'static str>) -> Vec<String> {
-        items.into_iter().map(str::to_string).collect()
-    }
-}
+#[path = "multi_rrf/tests.rs"]
+mod tests;
