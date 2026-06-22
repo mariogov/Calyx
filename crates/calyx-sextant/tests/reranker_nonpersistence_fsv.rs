@@ -1,20 +1,21 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use calyx_aster::cf::{ColumnFamily, base_key};
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{
-    Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality, SlotId, SlotVector, VaultId,
-    VaultStore,
+    Constellation, CxFlags, InputRef, LedgerRef, Modality, SlotId, SlotVector, VaultId, VaultStore,
 };
 use calyx_sextant::{RerankCandidateText, RerankRequest, RerankerClient};
 use serde_json::json;
+
+mod reranker_support;
+#[path = "sextant_support/mod.rs"]
+mod sextant_support;
+use reranker_support::spawn_reranker;
+use sextant_support::{cx_u8_fill as cx, hex};
 
 #[test]
 fn issue594_reranker_candidate_text_non_persistence_gpuhost_fsv() {
@@ -158,83 +159,6 @@ fn run_successful_rerank(candidate: &str) -> RerankObservation {
     }
 }
 
-struct TestServer {
-    endpoint: String,
-    request: Arc<Mutex<String>>,
-    handle: Mutex<Option<JoinHandle<()>>>,
-}
-
-impl TestServer {
-    fn request(&self) -> String {
-        self.request.lock().unwrap().clone()
-    }
-
-    fn join(&self) {
-        if let Some(handle) = self.handle.lock().unwrap().take() {
-            handle.join().unwrap();
-        }
-    }
-}
-
-fn spawn_reranker(status: &'static str, body: &'static str) -> TestServer {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let request = Arc::new(Mutex::new(String::new()));
-    let request_for_thread = Arc::clone(&request);
-    let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_millis(250)))
-            .unwrap();
-        let mut bytes = Vec::new();
-        loop {
-            let mut chunk = [0_u8; 4096];
-            match stream.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(read) => {
-                    bytes.extend_from_slice(&chunk[..read]);
-                    if http_request_complete(&bytes) {
-                        break;
-                    }
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    break;
-                }
-                Err(error) => panic!("read reranker request: {error}"),
-            }
-        }
-        *request_for_thread.lock().unwrap() = String::from_utf8(bytes).unwrap();
-        let response = format!(
-            "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).unwrap();
-    });
-    TestServer {
-        endpoint,
-        request,
-        handle: Mutex::new(Some(handle)),
-    }
-}
-
-fn http_request_complete(bytes: &[u8]) -> bool {
-    let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return false;
-    };
-    let headers = String::from_utf8_lossy(&bytes[..header_end]);
-    let content_len = headers
-        .lines()
-        .find_map(|line| line.strip_prefix("Content-Length: "))
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    bytes.len() >= header_end + 4 + content_len
-}
-
 fn request_body(request: &str) -> &str {
     request.split("\r\n\r\n").nth(1).unwrap()
 }
@@ -288,10 +212,6 @@ fn persisted_constellation() -> Constellation {
         },
         flags: CxFlags::default(),
     }
-}
-
-fn cx(value: u8) -> CxId {
-    CxId::from_bytes([value; 16])
 }
 
 fn vault_id() -> VaultId {
@@ -360,8 +280,4 @@ fn relative_path(root: &Path, path: &Path) -> String {
 
 fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
