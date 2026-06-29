@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 pub(super) const READY_SCHEMA: &str = "calyx-panel-resident-readiness-v1";
 pub(super) const MEASURE_SCHEMA: &str = "calyx-panel-resident-measure-v1";
+pub(super) const MEASURE_BATCH_SCHEMA: &str = "calyx-panel-resident-measure-batch-v1";
+pub(super) const RESIDENT_BINARY_PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Debug)]
 pub(super) enum ClientMeasureInput {
@@ -19,11 +21,13 @@ pub(super) struct ResidentRequest {
     pub(super) modality: Option<Modality>,
     pub(super) input: Option<String>,
     pub(super) input_hex: Option<String>,
+    pub(super) inputs_hex: Option<Vec<String>>,
+    pub(super) runtime_batch_limit: Option<usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(super) struct ReadyResponse {
-    pub(super) schema: &'static str,
+    pub(super) schema: String,
     pub(super) ready: bool,
     pub(super) residency_scope: &'static str,
     pub(super) process_id: u32,
@@ -51,9 +55,9 @@ pub(super) struct ReadyResponse {
     pub(super) cpu_content_lens_count: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(super) struct MeasureResponse {
-    pub(super) schema: &'static str,
+    pub(super) schema: String,
     pub(super) ready: bool,
     pub(super) process_id: u32,
     pub(super) template_source: String,
@@ -65,18 +69,69 @@ pub(super) struct MeasureResponse {
     pub(super) slots: Vec<ResidentSlotMeasure>,
 }
 
-#[derive(Serialize)]
-pub(super) struct ResidentSlotMeasure {
-    pub(super) slot: u16,
-    pub(super) key: String,
-    pub(super) lens_id: String,
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct MeasureBatchResponse {
+    pub(crate) schema: String,
+    pub(crate) ready: bool,
+    pub(crate) process_id: u32,
+    pub(crate) template_source: String,
+    pub(crate) modality: Modality,
+    pub(crate) input_count: usize,
+    pub(crate) elapsed_ms: u128,
+    pub(crate) runtime_batch_limit: Option<usize>,
+    pub(crate) rows: Vec<ResidentMeasuredInput>,
+}
+
+#[derive(Debug)]
+pub(crate) struct MeasureBatchAtResponse {
+    pub(crate) response: MeasureBatchResponse,
+    pub(crate) request_bytes: usize,
+    pub(crate) response_bytes: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(super) struct ResidentMeasureBatchBinaryRequest {
+    pub(super) protocol_version: u16,
     pub(super) modality: Modality,
-    pub(super) placement: Placement,
-    pub(super) measured: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) vector: Option<SlotVector>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) absent_reason: Option<AbsentReason>,
+    pub(super) inputs: Vec<Vec<u8>>,
+    pub(super) runtime_batch_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(super) struct ResidentMeasureBatchBinaryResponse {
+    pub(super) protocol_version: u16,
+    pub(super) result: ResidentMeasureBatchBinaryResult,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(super) enum ResidentMeasureBatchBinaryResult {
+    Ok(MeasureBatchResponse),
+    Err {
+        code: String,
+        message: String,
+        remediation: String,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct ResidentMeasuredInput {
+    pub(crate) input_index: usize,
+    pub(crate) input_len: usize,
+    pub(crate) measured_slot_count: usize,
+    pub(crate) absent_slot_count: usize,
+    pub(crate) slots: Vec<ResidentSlotMeasure>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct ResidentSlotMeasure {
+    pub(crate) slot: u16,
+    pub(crate) key: String,
+    pub(crate) lens_id: String,
+    pub(crate) modality: Modality,
+    pub(crate) placement: Placement,
+    pub(crate) measured: bool,
+    pub(crate) vector: Option<SlotVector>,
+    pub(crate) absent_reason: Option<AbsentReason>,
 }
 
 pub(super) fn hex_encode(bytes: &[u8]) -> String {

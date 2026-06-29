@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::str::FromStr;
 use std::time::Instant;
 
 use calyx_aster::vault::AsterVault;
@@ -14,6 +16,7 @@ use super::command::ingest_runtime_log;
 use super::worker::measure_lens_in_worker;
 use crate::error::CliResult;
 use crate::lens_commands::support::runtime_name;
+use crate::panel_commands::measure_resident_batch_at;
 
 /// Doctrine #1273 rule 3 ("never single — fail hard"): an ingest that leaves
 /// every declared, applicable content lens unmeasured would silently persist a
@@ -240,7 +243,7 @@ pub(crate) fn measure_constellation_microbatch(
     inputs: &[Input],
     now: u64,
 ) -> CliResult<Vec<Constellation>> {
-    measure_constellation_microbatch_with_runtime_limit(vault, state, inputs, now, None)
+    measure_constellation_microbatch_with_runtime_limit(vault, state, inputs, now, None, None)
 }
 
 pub(crate) fn measure_constellation_microbatch_with_runtime_limit(
@@ -249,6 +252,7 @@ pub(crate) fn measure_constellation_microbatch_with_runtime_limit(
     inputs: &[Input],
     now: u64,
     runtime_batch_limit: Option<usize>,
+    resident_addr: Option<SocketAddr>,
 ) -> CliResult<Vec<Constellation>> {
     if inputs.is_empty() {
         return Ok(Vec::new());
@@ -287,23 +291,32 @@ pub(crate) fn measure_constellation_microbatch_with_runtime_limit(
         }
     }
     ingest_runtime_log(format_args!(
-        "phase=measure_microbatch_start modality={:?} batch_size={} gpu_lenses={} cpu_lenses={} runtime_batch_limit={:?}",
+        "phase=measure_microbatch_start modality={:?} batch_size={} gpu_lenses={} cpu_lenses={} runtime_batch_limit={:?} resident_addr={:?}",
         batch_modality,
         inputs.len(),
         gpu_lenses.len(),
         cpu_lenses.len(),
-        runtime_batch_limit
+        runtime_batch_limit,
+        resident_addr
     ));
     let measure_one = |lens: ApplicableLens| {
         measure_applicable_lens_batch(state, lens, batch_modality, inputs, runtime_batch_limit)
             .map(|vectors| (lens.lens_id, vectors))
     };
     let (gpu_result, cpu_result) = rayon::join(
-        || {
-            gpu_lenses
+        || match resident_addr {
+            Some(addr) => resident_batch::measure_gpu_lenses_via_resident_service(
+                state,
+                &gpu_lenses,
+                batch_modality,
+                inputs,
+                runtime_batch_limit,
+                addr,
+            ),
+            None => gpu_lenses
                 .iter()
                 .map(|&lens| measure_one(lens))
-                .collect::<std::result::Result<Vec<_>, _>>()
+                .collect::<std::result::Result<Vec<_>, _>>(),
         },
         || {
             cpu_lenses
@@ -392,3 +405,5 @@ pub(crate) fn measure_constellation_microbatch_with_runtime_limit(
     ));
     Ok(out)
 }
+
+mod resident_batch;

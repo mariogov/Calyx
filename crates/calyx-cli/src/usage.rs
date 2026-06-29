@@ -20,7 +20,7 @@ pub(crate) fn usage() -> &'static str {
        calyx park-lens <vault> --slot <u16>
        calyx list-panel <vault>
        calyx profile-lens [--name <n>] [--runtime <r>] [--endpoint <url-or-runtime-id>] [--weights <path>] [--shape Dense(<dim>)|Sparse(<dim>)] [--modality <m>] [--probe <path>]
-       calyx ingest <vault> (--text <s> | --batch <jsonl-path> | --file <path> --modality <image|audio|video>) [--idempotent] [--output <summary|rows>]
+       calyx ingest <vault> (--text <s> | --batch <jsonl-path> | --file <path> --modality <image|audio|video>) [--idempotent] [--output <summary|rows>] [--resident-addr <127.0.0.1:port>]
        calyx anchor <vault> <cx_id> --kind <test-pass|thumbs-up|thumbs-down|label:<s>|speaker-match|style-hold> --value <v> [--confidence <0..1>] [--source <s>]
        calyx measure <vault> --text <s>
        calyx search <vault> <query> [--k <n>] [--fusion <rrf|weighted-rrf|single-lens|kernel-first|pipeline>] [--guard <off|in-region>] [--explain] [--provenance|--no-provenance] [--fresh|--stale-ok] [--filter <json-predicate>]
@@ -61,6 +61,8 @@ pub(crate) fn usage() -> &'static str {
        calyx panel template profile --template <name-or-id> (--card <json> ... | --card-dir <dir>) [--assay-card <ensemble_card.json>] [--home <dir>]
        calyx panel template swap --template <name-or-id> --vault <vault> [--require-a37-gate] [--home <dir>]
        calyx panel batch-limit --vault <vault> --set <name-or-id>=<max_batch> [--set <name-or-id>=<max_batch> ...] [--preflight-text <text>] [--preflight-repeat <n>]
+       calyx panel registry-audit --vault <vault>
+       calyx panel registry-repair --vault <vault> (--slot <u16>|--all)
        calyx panel warm --template <name-or-id> [--home <dir>] [--hold-secs <n>] [--out <json>] [--progress-out <jsonl>] [--max-resident-vram-mib <n>] [--resident-overhead-multiplier <n>] [--max-load-secs <n>] [--load-parallelism <n>]
        calyx panel a38-bundle save --name <name> --base-template <name-or-id> --required-modality <m> --include-lens <name-or-id> --evidence <json> [--home <dir>] [--budget-vram-mib <n>]
        calyx panel a38-bundle list [--home <dir>]
