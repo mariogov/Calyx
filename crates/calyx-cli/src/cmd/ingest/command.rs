@@ -4,8 +4,10 @@ use std::io::Write;
 use calyx_aster::cf::{ColumnFamily, anchor_key, base_key};
 use calyx_aster::dedup::{AnchorConflictResult, check_anchor_conflict};
 use calyx_aster::vault::AsterVault;
-use calyx_aster::vault::encode;
-use calyx_core::{Anchor, AnchorKind, CxId, Input, Modality, SlotState, VaultStore};
+use calyx_aster::vault::encode::{self, decode_constellation_base};
+use calyx_core::{
+    Anchor, AnchorKind, Constellation, CxId, Input, InputRef, Modality, SlotState, VaultStore,
+};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_registry::{VaultPanelState, load_vault_panel_state};
 
@@ -15,10 +17,12 @@ use super::super::{AnchorArgs, IngestArgs, MeasureArgs, Subcommand};
 use super::anchor::{parse_anchor_kind, parse_anchor_value};
 use super::batch::{BatchRow, parse_batch_line, validate_batch_file};
 use super::constellation::{
-    ensure_content_panel_floor, measure_constellation,
+    ensure_content_panel_floor, input_hash, measure_constellation,
     measure_constellation_microbatch_with_runtime_limit, text_input,
 };
-use super::ledger::{append_anchor_ledger, append_anchor_marker_ledger, append_cli_ledger};
+use super::ledger::{
+    append_anchor_ledger, append_anchor_marker_ledger, append_cli_batch_ledger, append_cli_ledger,
+};
 use super::oracle_event::{OracleEvent, append_recurrence_if_absent};
 use super::store::{base_exists, ensure_base_exists, open_vault, resolve_cli_vault};
 use super::types::{AnchorReport, BatchIngestSummary, IngestOutput, IngestReport};
@@ -50,6 +54,9 @@ const DEFAULT_MEASURE_WINDOW: usize = 128;
 /// Constellations per WAL commit. Small because ColBERT multi-vectors are large;
 /// decoupled from the measure batch so we measure big but commit WAL-safe.
 const PUT_CHUNK: usize = 8;
+/// Existing-row replay does not stage vector payloads, so it can verify and ledger
+/// larger groups without the ColBERT WAL pressure that constrains new puts.
+const EXISTING_REPLAY_CHUNK: usize = 128;
 const MEASURE_BATCH_ENV: &str = "CALYX_MEASURE_BATCH";
 const MEASURE_WINDOW_ENV: &str = "CALYX_INGEST_MEASURE_WINDOW";
 
@@ -482,6 +489,7 @@ fn ingest_validated_batch_streaming_with_output(
         "phase=batch_ingest_plan rows={} runtime_batch_limit={} measure_window={} put_chunk={} output={:?}",
         validated_row_count, runtime_batch_limit, measure_window, PUT_CHUNK, output
     ));
+    preflight_batch_existing_identity(&vault, &state, path, validated_row_count)?;
     let mut chunk: Vec<BatchRow> = Vec::with_capacity(measure_window);
     let mut summary = BatchIngestSummary::empty();
     for (index, line) in reader.lines().enumerate() {
@@ -513,7 +521,22 @@ fn ingest_validated_batch_streaming_with_output(
             runtime_batch_limit,
         )?;
     }
-    rebuild_persistent_indexes(&resolved.path, &vault)?;
+    if summary.new_count > 0 {
+        ingest_runtime_log(format_args!(
+            "phase=batch_index_rebuild_start new_count={} already_count={}",
+            summary.new_count, summary.already_count
+        ));
+        rebuild_persistent_indexes(&resolved.path, &vault)?;
+        ingest_runtime_log(format_args!(
+            "phase=batch_index_rebuild_ok new_count={} already_count={}",
+            summary.new_count, summary.already_count
+        ));
+    } else {
+        ingest_runtime_log(format_args!(
+            "phase=batch_index_rebuild_skip reason=no_new_constellations already_count={}",
+            summary.already_count
+        ));
+    }
     Ok(summary)
 }
 
@@ -527,6 +550,26 @@ fn flush_measure_batch(
     runtime_batch_limit: usize,
 ) -> CliResult<()> {
     let rows: Vec<BatchRow> = std::mem::take(chunk);
+    if rows.iter().all(|(_, _, _, oracle)| oracle.is_none()) {
+        if let Some(existing_rows) = existing_plain_batch_replay_rows(vault, state, &rows)? {
+            ingest_runtime_log(format_args!(
+                "phase=batch_existing_replay_base_only_fast_path rows={} runtime_batch_limit={} measurement_skipped=true slot_decode_skipped=true",
+                existing_rows.len(),
+                runtime_batch_limit
+            ));
+            flush_plain_existing_batch_replay(vault, existing_rows, summary, output)?;
+            return Ok(());
+        }
+    }
+    if let Some(existing_rows) = existing_batch_replay_rows(vault, state, &rows)? {
+        ingest_runtime_log(format_args!(
+            "phase=batch_existing_replay_fast_path rows={} runtime_batch_limit={} measurement_skipped=true",
+            existing_rows.len(),
+            runtime_batch_limit
+        ));
+        flush_existing_batch_replay(vault, state, existing_rows, summary, output)?;
+        return Ok(());
+    }
     let inputs: Vec<Input> = rows
         .iter()
         .map(|(text, _, _, _)| text_input(text.clone()))
@@ -619,12 +662,15 @@ fn flush_measure_batch(
             )?;
         }
         append_oracle_events(vault, &order)?;
+        let idempotent_ledger_seq = append_idempotent_batch_ledger(vault, &order)?;
         for row in order {
             let cx_id = row.cx_id;
             let ledger_seq = if row.new {
                 vault.get(cx_id, snapshot)?.provenance.seq
             } else {
-                append_cli_ledger(vault, EntryKind::Ingest, cx_id, "cli-idempotent-ingest")?
+                idempotent_ledger_seq.ok_or_else(|| {
+                    CliError::usage("missing idempotent batch ledger seq for replay row")
+                })?
             };
             for kind in row.marker_kinds {
                 append_anchor_marker_ledger(vault, cx_id, &kind)?;
@@ -644,6 +690,431 @@ fn flush_measure_batch(
     Ok(())
 }
 
+fn preflight_batch_existing_identity(
+    vault: &AsterVault,
+    state: &VaultPanelState,
+    path: &std::path::Path,
+    validated_row_count: usize,
+) -> CliResult<()> {
+    use std::io::BufRead;
+
+    let started = std::time::Instant::now();
+    ingest_runtime_log(format_args!(
+        "phase=batch_existing_identity_preflight_start rows={validated_row_count}"
+    ));
+    let file = std::fs::File::open(path)
+        .map_err(|err| CliError::io(format!("open batch {}: {err}", path.display())))?;
+    let reader = std::io::BufReader::new(file);
+    let snapshot = vault.snapshot();
+    let mut checked_existing = 0_usize;
+    let mut not_existing_or_incomplete = 0_usize;
+    for (index, line) in reader.lines().enumerate() {
+        let line =
+            line.map_err(|err| CliError::io(format!("read batch line {}: {err}", index + 1)))?;
+        let Some((text, mut metadata, anchors, oracle)) = parse_batch_line(index, &line)? else {
+            continue;
+        };
+        if let Some(event) = &oracle {
+            event.apply_metadata(&mut metadata)?;
+        }
+        let input = text_input(text);
+        let row = ExistingPlainReplayRow {
+            cx_id: vault.cx_id_for_input(&input.bytes, state.panel.version),
+            panel_version: state.panel.version,
+            input_ref: InputRef {
+                hash: input_hash(&input.bytes),
+                pointer: input.pointer,
+                redacted: false,
+            },
+            modality: input.modality,
+            metadata,
+            anchors,
+        };
+        if verify_existing_base_replay_row(vault, snapshot, &row)? {
+            checked_existing += 1;
+        } else {
+            not_existing_or_incomplete += 1;
+        }
+    }
+    ingest_runtime_log(format_args!(
+        "phase=batch_existing_identity_preflight_ok rows={} existing_checked={} not_existing_or_incomplete={} elapsed_ms={}",
+        validated_row_count,
+        checked_existing,
+        not_existing_or_incomplete,
+        started.elapsed().as_millis()
+    ));
+    Ok(())
+}
+
+struct ExistingPlainReplayRow {
+    cx_id: CxId,
+    panel_version: u32,
+    input_ref: InputRef,
+    modality: Modality,
+    metadata: BTreeMap<String, String>,
+    anchors: Vec<Anchor>,
+}
+
+struct ExistingBatchReplayRow {
+    cx_id: CxId,
+    input_ref: InputRef,
+    modality: Modality,
+    metadata: BTreeMap<String, String>,
+    anchors: Vec<Anchor>,
+    oracle: Option<OracleEvent>,
+}
+
+fn existing_plain_batch_replay_rows(
+    vault: &AsterVault,
+    state: &VaultPanelState,
+    rows: &[BatchRow],
+) -> CliResult<Option<Vec<ExistingPlainReplayRow>>> {
+    let mut out = Vec::with_capacity(rows.len());
+    let snapshot = vault.snapshot();
+    let mut all_materialized = true;
+    let mut checked_existing = 0_usize;
+    for (text, metadata, anchors, _) in rows {
+        let input = text_input(text.clone());
+        let cx_id = vault.cx_id_for_input(&input.bytes, state.panel.version);
+        let input_ref = InputRef {
+            hash: input_hash(&input.bytes),
+            pointer: input.pointer,
+            redacted: false,
+        };
+        let row = ExistingPlainReplayRow {
+            cx_id,
+            panel_version: state.panel.version,
+            input_ref,
+            modality: input.modality,
+            metadata: metadata.clone(),
+            anchors: anchors.clone(),
+        };
+        if !verify_existing_base_replay_row(vault, snapshot, &row)? {
+            all_materialized = false;
+            continue;
+        }
+        checked_existing += 1;
+        out.push(row);
+    }
+    if all_materialized {
+        Ok(Some(out))
+    } else {
+        ingest_runtime_log(format_args!(
+            "phase=batch_existing_replay_base_only_preflight_mixed rows={} existing_materialized={} measurement_required=true slot_decode_skipped=true",
+            rows.len(),
+            checked_existing
+        ));
+        Ok(None)
+    }
+}
+
+fn flush_plain_existing_batch_replay(
+    vault: &AsterVault,
+    rows: Vec<ExistingPlainReplayRow>,
+    summary: &mut BatchIngestSummary,
+    output: IngestOutput,
+) -> CliResult<()> {
+    for sub in rows.chunks(EXISTING_REPLAY_CHUNK) {
+        let ids = sub.iter().map(|row| row.cx_id).collect::<Vec<_>>();
+        let ledger_seq = append_cli_batch_ledger(
+            vault,
+            EntryKind::Ingest,
+            &ids,
+            "cli-idempotent-ingest-batch",
+        )?;
+        vault.flush()?;
+        let snapshot = vault.snapshot();
+        for row in sub {
+            if !verify_existing_base_replay_row(vault, snapshot, row)? {
+                return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                    "idempotent batch replay base readback missing for cx {} after ledger append",
+                    row.cx_id
+                ))
+                .into());
+            }
+            let report = IngestReport {
+                cx_id: row.cx_id.to_string(),
+                new: false,
+                ledger_seq,
+            };
+            summary.record(&report);
+            if output == IngestOutput::Rows {
+                print_json(&report)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_existing_base_replay_row(
+    vault: &AsterVault,
+    snapshot: u64,
+    row: &ExistingPlainReplayRow,
+) -> CliResult<bool> {
+    let Some(bytes) = vault.read_cf_at(snapshot, ColumnFamily::Base, &base_key(row.cx_id))? else {
+        return Ok(false);
+    };
+    let existing = decode_constellation_base(&bytes)?;
+    if existing.panel_version != row.panel_version
+        || existing.input_ref != row.input_ref
+        || existing.modality != row.modality
+        || existing.metadata != row.metadata
+    {
+        return Err(CliError::usage(format!(
+            "idempotent batch replay for cx {} changed stored non-anchor identity: {}",
+            row.cx_id,
+            identity_mismatch_reason(
+                existing.panel_version,
+                row.panel_version,
+                &existing.input_ref,
+                &row.input_ref,
+                existing.modality,
+                row.modality,
+                &existing.metadata,
+                &row.metadata,
+            )
+        )));
+    }
+    if !incoming_anchors_already_materialized(vault, snapshot, row.cx_id, &row.anchors, &existing)?
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn incoming_anchors_already_materialized(
+    vault: &AsterVault,
+    snapshot: u64,
+    cx_id: CxId,
+    incoming_anchors: &[Anchor],
+    existing_base: &Constellation,
+) -> CliResult<bool> {
+    if incoming_anchors.is_empty() {
+        return Ok(true);
+    }
+    let mut incoming = existing_base.clone();
+    incoming.anchors = incoming_anchors.to_vec();
+    if let AnchorConflictResult::Conflicting {
+        anchor_type,
+        reason,
+    } = check_anchor_conflict(&incoming, existing_base)
+    {
+        return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+            "idempotent batch replay for cx {cx_id} has conflicting {anchor_type:?} anchor: {reason:?}"
+        ))
+        .into());
+    }
+    for anchor in incoming_anchors {
+        if !existing_base
+            .anchors
+            .iter()
+            .any(|existing| existing.kind == anchor.kind)
+        {
+            return Ok(false);
+        }
+        let Some(bytes) = vault.read_cf_at(
+            snapshot,
+            ColumnFamily::Anchors,
+            &anchor_key(cx_id, &anchor.kind),
+        )?
+        else {
+            return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                "idempotent batch replay for cx {cx_id} found anchor {:?} in Base CF but missing from Anchors CF",
+                anchor.kind
+            ))
+            .into());
+        };
+        let indexed = encode::decode_anchor(&bytes)?;
+        if indexed.kind != anchor.kind || indexed.value != anchor.value {
+            return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                "idempotent batch replay for cx {cx_id} found conflicting Anchors CF value for {:?}",
+                anchor.kind
+            ))
+            .into());
+        }
+    }
+    Ok(true)
+}
+
+fn existing_batch_replay_rows(
+    vault: &AsterVault,
+    state: &VaultPanelState,
+    rows: &[BatchRow],
+) -> CliResult<Option<Vec<ExistingBatchReplayRow>>> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut all_exist = true;
+    let mut checked_existing = 0_usize;
+    for (text, metadata, anchors, oracle) in rows {
+        let input = text_input(text.clone());
+        let cx_id = vault.cx_id_for_input(&input.bytes, state.panel.version);
+        if !base_exists(vault, cx_id)? {
+            all_exist = false;
+            continue;
+        }
+        let input_ref = InputRef {
+            hash: input_hash(&input.bytes),
+            pointer: input.pointer,
+            redacted: false,
+        };
+        let row = ExistingBatchReplayRow {
+            cx_id,
+            input_ref,
+            modality: input.modality,
+            metadata: metadata.clone(),
+            anchors: anchors.clone(),
+            oracle: oracle.clone(),
+        };
+        verify_existing_batch_replay_identity(vault, state, &row)?;
+        checked_existing += 1;
+        out.push(row);
+    }
+    if all_exist {
+        Ok(Some(out))
+    } else {
+        ingest_runtime_log(format_args!(
+            "phase=batch_existing_replay_preflight_mixed rows={} existing_checked={} measurement_required=true",
+            rows.len(),
+            checked_existing
+        ));
+        Ok(None)
+    }
+}
+
+fn flush_existing_batch_replay(
+    vault: &AsterVault,
+    state: &VaultPanelState,
+    rows: Vec<ExistingBatchReplayRow>,
+    summary: &mut BatchIngestSummary,
+    output: IngestOutput,
+) -> CliResult<()> {
+    for sub in rows.chunks(EXISTING_REPLAY_CHUNK) {
+        let mut order = Vec::with_capacity(sub.len());
+        let mut known_anchor_kinds = BTreeMap::<CxId, BTreeSet<AnchorKind>>::new();
+        for row in sub {
+            let existing = verify_existing_batch_replay_identity(vault, state, row)?;
+            let known = match known_anchor_kinds.entry(row.cx_id) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(current_anchor_kinds(vault, row.cx_id, true)?)
+                }
+            };
+            let mut marker_kinds = Vec::new();
+            for anchor in &row.anchors {
+                if known.insert(anchor.kind.clone()) {
+                    marker_kinds.push(anchor.kind.clone());
+                }
+            }
+            let incoming = existing_replay_incoming(&existing, row);
+            let expected_readback = if marker_kinds.is_empty() {
+                existing
+            } else {
+                append_missing_batch_anchors(vault, &existing, &incoming, &marker_kinds)?
+            };
+            order.push(BatchOrderRow {
+                cx_id: row.cx_id,
+                expected_readback,
+                new: false,
+                marker_kinds,
+                oracle: row.oracle.clone(),
+            });
+        }
+        vault.flush()?;
+        let snapshot = vault.snapshot();
+        for row in &order {
+            verify_base_readback(
+                vault,
+                snapshot,
+                &row.expected_readback,
+                row.cx_id,
+                &row.marker_kinds,
+            )?;
+        }
+        append_oracle_events(vault, &order)?;
+        let idempotent_ledger_seq = append_idempotent_batch_ledger(vault, &order)?;
+        for row in order {
+            let cx_id = row.cx_id;
+            let ledger_seq = idempotent_ledger_seq.ok_or_else(|| {
+                CliError::usage("missing idempotent batch ledger seq for replay row")
+            })?;
+            for kind in row.marker_kinds {
+                append_anchor_marker_ledger(vault, cx_id, &kind)?;
+            }
+            let report = IngestReport {
+                cx_id: cx_id.to_string(),
+                new: false,
+                ledger_seq,
+            };
+            summary.record(&report);
+            if output == IngestOutput::Rows {
+                print_json(&report)?;
+            }
+        }
+        vault.flush()?;
+    }
+    Ok(())
+}
+
+fn append_idempotent_batch_ledger(
+    vault: &AsterVault,
+    order: &[BatchOrderRow],
+) -> CliResult<Option<u64>> {
+    let ids = order
+        .iter()
+        .filter(|row| !row.new)
+        .map(|row| row.cx_id)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    append_cli_batch_ledger(
+        vault,
+        EntryKind::Ingest,
+        &ids,
+        "cli-idempotent-ingest-batch",
+    )
+    .map(Some)
+}
+
+fn verify_existing_batch_replay_identity(
+    vault: &AsterVault,
+    state: &VaultPanelState,
+    row: &ExistingBatchReplayRow,
+) -> CliResult<Constellation> {
+    let existing = vault.get(row.cx_id, vault.snapshot())?;
+    if existing.panel_version != state.panel.version
+        || existing.input_ref != row.input_ref
+        || existing.modality != row.modality
+        || existing.metadata != row.metadata
+    {
+        return Err(CliError::usage(format!(
+            "idempotent batch replay for cx {} changed stored non-anchor identity: {}",
+            row.cx_id,
+            identity_mismatch_reason(
+                existing.panel_version,
+                state.panel.version,
+                &existing.input_ref,
+                &row.input_ref,
+                existing.modality,
+                row.modality,
+                &existing.metadata,
+                &row.metadata,
+            )
+        )));
+    }
+    ensure_content_panel_floor(&existing, state)?;
+    Ok(existing)
+}
+
+fn existing_replay_incoming(
+    existing: &Constellation,
+    row: &ExistingBatchReplayRow,
+) -> Constellation {
+    let mut incoming = existing.clone();
+    incoming.anchors = row.anchors.clone();
+    incoming.flags.ungrounded = incoming.anchors.is_empty();
+    incoming
+}
+
 pub(super) fn should_stage_batch_constellation(new: bool, marker_kinds: &[AnchorKind]) -> bool {
     new || !marker_kinds.is_empty()
 }
@@ -659,11 +1130,86 @@ fn ensure_idempotent_batch_replay(
         || existing.metadata != cx.metadata
     {
         return Err(CliError::usage(format!(
-            "idempotent batch replay for cx {} changed stored non-anchor identity",
-            cx.cx_id
+            "idempotent batch replay for cx {} changed stored non-anchor identity: {}",
+            cx.cx_id,
+            identity_mismatch_reason(
+                existing.panel_version,
+                cx.panel_version,
+                &existing.input_ref,
+                &cx.input_ref,
+                existing.modality,
+                cx.modality,
+                &existing.metadata,
+                &cx.metadata,
+            )
         )));
     }
     Ok(existing)
+}
+
+fn identity_mismatch_reason(
+    existing_panel_version: u32,
+    incoming_panel_version: u32,
+    existing_input_ref: &InputRef,
+    incoming_input_ref: &InputRef,
+    existing_modality: Modality,
+    incoming_modality: Modality,
+    existing_metadata: &BTreeMap<String, String>,
+    incoming_metadata: &BTreeMap<String, String>,
+) -> String {
+    let mut reasons = Vec::new();
+    if existing_panel_version != incoming_panel_version {
+        reasons.push(format!(
+            "panel_version existing={} incoming={}",
+            existing_panel_version, incoming_panel_version
+        ));
+    }
+    if existing_input_ref != incoming_input_ref {
+        let mut input_parts = Vec::new();
+        if existing_input_ref.hash != incoming_input_ref.hash {
+            input_parts.push("hash");
+        }
+        if existing_input_ref.pointer != incoming_input_ref.pointer {
+            input_parts.push("pointer");
+        }
+        if existing_input_ref.redacted != incoming_input_ref.redacted {
+            input_parts.push("redacted");
+        }
+        reasons.push(format!("input_ref fields={}", input_parts.join(",")));
+    }
+    if existing_modality != incoming_modality {
+        reasons.push(format!(
+            "modality existing={existing_modality:?} incoming={incoming_modality:?}"
+        ));
+    }
+    if existing_metadata != incoming_metadata {
+        let existing_keys = existing_metadata.keys().cloned().collect::<BTreeSet<_>>();
+        let incoming_keys = incoming_metadata.keys().cloned().collect::<BTreeSet<_>>();
+        let removed = existing_keys
+            .difference(&incoming_keys)
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>();
+        let added = incoming_keys
+            .difference(&existing_keys)
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>();
+        let changed = existing_keys
+            .intersection(&incoming_keys)
+            .filter(|key| existing_metadata.get(*key) != incoming_metadata.get(*key))
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>();
+        reasons.push(format!(
+            "metadata removed_keys={removed:?} added_keys={added:?} changed_keys={changed:?}"
+        ));
+    }
+    if reasons.is_empty() {
+        "unknown identity mismatch".to_string()
+    } else {
+        reasons.join("; ")
+    }
 }
 
 fn append_missing_batch_anchors(
@@ -672,9 +1218,6 @@ fn append_missing_batch_anchors(
     incoming: &calyx_core::Constellation,
     marker_kinds: &[AnchorKind],
 ) -> CliResult<calyx_core::Constellation> {
-    if marker_kinds.is_empty() {
-        return Ok(existing.clone());
-    }
     if let AnchorConflictResult::Conflicting {
         anchor_type,
         reason,
@@ -685,6 +1228,9 @@ fn append_missing_batch_anchors(
             incoming.cx_id
         ))
         .into());
+    }
+    if marker_kinds.is_empty() {
+        return Ok(existing.clone());
     }
 
     let marker_kinds = marker_kinds.iter().collect::<BTreeSet<_>>();

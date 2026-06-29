@@ -94,6 +94,9 @@ tmp/
 *.ptx
 *.fatbin
 
+# ── Docs (not published to the public mirror — kept in the private repo) ─
+/docs/
+
 # ── Editors / IDE ────────────────────────────────────────────────────
 .vscode/
 .idea/
