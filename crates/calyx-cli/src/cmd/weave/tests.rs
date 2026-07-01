@@ -27,6 +27,7 @@ fn defaults_apply_when_only_vault_given() {
     );
     assert_eq!(args.batch, DEFAULT_BATCH);
     assert_eq!(args.limit, 0);
+    assert_eq!(args.time_budget_ms, None);
 }
 
 #[test]
@@ -45,6 +46,8 @@ fn all_flags_parse() {
         "1000",
         "--limit",
         "50",
+        "--time-budget-ms",
+        "5000",
     ])
     .unwrap();
     assert_eq!(args.content_slot, Some(8));
@@ -53,6 +56,7 @@ fn all_flags_parse() {
     assert_eq!(args.max_groundedness_distance, 4);
     assert_eq!(args.batch, 1000);
     assert_eq!(args.limit, 50);
+    assert_eq!(args.time_budget_ms, Some(5000));
 }
 
 #[test]
@@ -94,6 +98,7 @@ fn unknown_flag_fails_closed() {
 fn limit_zero_is_valid_meaning_all() {
     let args = parse(&["corpus", "--limit", "0"]).unwrap();
     assert_eq!(args.limit, 0);
+    assert_eq!(args.time_budget_ms, None);
 }
 
 #[test]
@@ -127,7 +132,7 @@ fn requested_sparse_content_slot_fails_with_incompatible_readback() {
     let content_slots = super::content_lens_slots(&panel);
     let incompatible_slots = super::incompatible_content_lens_slots(&panel);
 
-    let err = super::resolve_knn_slot(Some(11), &content_slots, &incompatible_slots)
+    let err = super::resolve_requested_slot(Some(11), &content_slots, &incompatible_slots)
         .expect_err("sparse content slot must fail before vault mutation");
     let message = err.to_string();
 
