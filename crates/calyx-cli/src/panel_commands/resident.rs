@@ -12,8 +12,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+mod discovery;
 mod flags;
 mod protocol;
+
+pub(crate) use discovery::{ResidentDiscovery, read_resident_discovery, resident_discovery_path};
 
 use flags::{
     ServeFlags, calyx_home, ensure_loopback, parse_addr, parse_client_flags, parse_serve_flags,
@@ -21,8 +24,8 @@ use flags::{
 use protocol::{
     ClientMeasureInput, MEASURE_BATCH_SCHEMA, MEASURE_SCHEMA, MeasureResponse, READY_SCHEMA,
     RESIDENT_BINARY_PROTOCOL_VERSION, ReadyResponse, ResidentMeasureBatchBinaryRequest,
-    ResidentMeasureBatchBinaryResponse, ResidentMeasureBatchBinaryResult, ResidentRequest,
-    hex_decode,
+    ResidentMeasureBatchStreamEnd, ResidentMeasureBatchStreamFrame,
+    ResidentMeasureBatchStreamHeader, ResidentRequest, hex_decode,
 };
 pub(crate) use protocol::{
     MeasureBatchAtResponse, MeasureBatchResponse, ResidentMeasuredInput, ResidentSlotMeasure,
@@ -48,11 +51,12 @@ mod client;
 mod codec;
 mod dispatch;
 mod server;
+mod stream;
 
 #[cfg(test)]
 mod tests;
 
-pub(crate) use client::measure_batch_at;
+pub(crate) use client::{measure_batch_at, ready_value_at};
 pub(crate) fn run(args: &[String]) -> CliResult {
     let Some(command) = args.first().map(String::as_str) else {
         return Err(CliError::usage(

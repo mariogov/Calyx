@@ -1,5 +1,10 @@
 //! Registry runtimes for frozen Calyx lenses.
 
+/// True when this build compiled the candle/fastembed CUDA embedder paths
+/// (`candle-cuda` feature). Exported for build-info capability readback
+/// (#1130): deploy gates assert this resolved value, not a feature spelling.
+pub const CANDLE_CUDA_COMPILED: bool = cfg!(feature = "candle-cuda");
+
 pub mod backfill;
 pub mod commission;
 pub mod compression;
@@ -71,8 +76,9 @@ pub use persistence_contracts::{
     RegistryContractAudit, RegistryContractDiff, RegistryContractFieldDiff,
     RegistryContractRepairChange, VaultRegistryContractRepairAllWrite,
     VaultRegistryContractRepairWrite, audit_registry_snapshot_contracts,
-    audit_vault_registry_contracts, repair_vault_registry_contracts_from_specs,
-    repair_vault_registry_slot_from_spec, require_vault_registry_contracts,
+    audit_vault_registry_contracts, lens_spec_with_frozen_contract,
+    repair_vault_registry_contracts_from_specs, repair_vault_registry_slot_from_spec,
+    require_vault_registry_contracts,
 };
 pub use placement::{
     CALYX_RAM_BUDGET_EXCEEDED, CALYX_VRAM_BUDGET_EXCEEDED, CpuLensPool, CpuPoolAdmission,
