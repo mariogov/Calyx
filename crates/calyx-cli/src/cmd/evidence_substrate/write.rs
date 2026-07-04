@@ -3,7 +3,11 @@ use std::fs;
 use std::path::Path;
 
 use calyx_aster::cf::ColumnFamily;
-use calyx_aster::plain_graph::{PhysicalPlainGraph, PlainGraph, PlainGraphCsr, PlainGraphCsrEdge};
+use calyx_aster::plain_graph::{
+    GraphCollectionGenerationState, GraphCollectionGenerationStatus, GraphCollectionLifecycle,
+    PhysicalGraphCollectionLifecycle, PhysicalPlainGraph, PlainGraph, PlainGraphCsr,
+    PlainGraphCsrEdge, plain_graph_edge_raw_weight, plain_graph_normalized_edge_weight,
+};
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{AnchorKind, CalyxError, CxId, VaultStore};
 use calyx_lodestar::{AsterAssocNodeProps, encode_assoc_node_props};
@@ -14,7 +18,7 @@ use sha2::{Digest, Sha256};
 use super::model::{EvidenceGraphDraft, edge_value};
 use super::source::SourceLoadReport;
 use super::{DEFAULT_COLLECTION, MaterializeEvidenceSubstrateArgs};
-use crate::cmd::vault::{resolve_vault_info, vault_salt};
+use crate::cmd::vault::{ResolvedVault, resolve_vault_info, vault_salt};
 use crate::error::{CliError, CliResult};
 
 const GRAPH_ID_VERSION: u32 = 0;
@@ -26,6 +30,7 @@ pub(crate) struct MaterializeEvidenceSubstrateReport {
     pub vault_id: String,
     pub vault_dir: String,
     pub collection: String,
+    pub graph_generation: String,
     pub panel_version: u32,
     pub source_report: SourceLoadReport,
     pub graph_summary: serde_json::Value,
@@ -79,6 +84,18 @@ pub(crate) fn write_to_calyx(
         },
     )?;
     let graph = PlainGraph::new(&vault, &collection)?;
+    let generation = format!("materialize-evidence-substrate-{}", ulid::Ulid::new());
+    let lifecycle = GraphCollectionLifecycle::new(&vault)?;
+    lifecycle.put_state(
+        &GraphCollectionGenerationState::new(
+            collection.clone(),
+            generation.clone(),
+            GraphCollectionGenerationStatus::Writing,
+            "materialize-evidence-substrate",
+        )
+        .with_reason("graph materialization started")
+        .with_detail("schema", "evidence_substrate_v1"),
+    )?;
     let salt = resolved.vault_id.to_string();
     let mut node_ids = BTreeMap::new();
     let mut node_values = BTreeMap::new();
@@ -134,41 +151,9 @@ pub(crate) fn write_to_calyx(
     vault.flush()?;
     drop(graph);
     drop(vault);
-    let physical = PhysicalPlainGraph::open_latest(&resolved.path, &collection)?;
-    for (id, expected) in &node_values {
-        let actual = physical.get_node(*id)?.ok_or_else(|| {
-            CliError::from(CalyxError {
-                code: "CALYX_EVIDENCE_SUBSTRATE_NODE_READBACK_MISSING",
-                message: format!("missing physical Graph CF node row {id}"),
-                remediation: "do not trust the evidence substrate collection until the command rewrites and reads back every node",
-            })
-        })?;
-        if &actual != expected {
-            return Err(CliError::from(CalyxError {
-                code: "CALYX_EVIDENCE_SUBSTRATE_NODE_READBACK_MISMATCH",
-                message: format!("physical Graph CF node row {id} differed after flush"),
-                remediation: "do not trust the evidence substrate collection until the node value mismatch is fixed and rerun",
-            }));
-        }
-    }
-    for (src, edge_type, dst, expected) in &edge_values {
-        let actual = physical.get_edge(*src, edge_type, *dst)?.ok_or_else(|| {
-            CliError::from(CalyxError {
-                code: "CALYX_EVIDENCE_SUBSTRATE_EDGE_READBACK_MISSING",
-                message: format!("missing physical Graph CF edge row {src} -{edge_type}-> {dst}"),
-                remediation: "do not trust the evidence substrate collection until the command rewrites and reads back every edge",
-            })
-        })?;
-        if &actual != expected {
-            return Err(CliError::from(CalyxError {
-                code: "CALYX_EVIDENCE_SUBSTRATE_EDGE_READBACK_MISMATCH",
-                message: format!(
-                    "physical Graph CF edge row {src} -{edge_type}-> {dst} differed after flush"
-                ),
-                remediation: "do not trust the evidence substrate collection until the edge value mismatch is fixed and rerun",
-            }));
-        }
-    }
+    let physical = PhysicalPlainGraph::open_latest_unchecked(&resolved.path, &collection)?;
+    read_back_nodes(&physical, &node_values)?;
+    let physical_edge_out_keys = read_back_edges(&physical, &edge_values)?;
     let raw = physical.read_csr_bytes()?.ok_or_else(|| {
         CliError::from(CalyxError {
             code: "CALYX_EVIDENCE_SUBSTRATE_CSR_READBACK_MISSING",
@@ -187,7 +172,7 @@ pub(crate) fn write_to_calyx(
     })?;
     let assoc = physical.assoc_graph()?;
     let physical_nodes = node_values.len();
-    let physical_edges = edge_values.len();
+    let physical_edges = physical_edge_out_keys;
     if physical_nodes != draft.nodes.len()
         || physical_edges != draft.edges.len()
         || csr.nodes.len() != draft.nodes.len()
@@ -212,10 +197,11 @@ pub(crate) fn write_to_calyx(
     let graph_summary = draft.association_summary();
     let report = MaterializeEvidenceSubstrateReport {
         status: "ok",
-        vault: resolved.name,
+        vault: resolved.name.clone(),
         vault_id: resolved.vault_id.to_string(),
         vault_dir: resolved.path.display().to_string(),
         collection,
+        graph_generation: generation.clone(),
         panel_version: GRAPH_ID_VERSION,
         source_report,
         graph_summary,
@@ -254,7 +240,152 @@ pub(crate) fn write_to_calyx(
             )));
         }
     }
+    accept_generation(
+        &resolved,
+        &report.collection,
+        &generation,
+        &report,
+        args.report.as_deref(),
+    )?;
     Ok(report)
+}
+
+fn accept_generation(
+    resolved: &ResolvedVault,
+    collection: &str,
+    generation: &str,
+    report: &MaterializeEvidenceSubstrateReport,
+    report_path: Option<&Path>,
+) -> CliResult {
+    let vault = AsterVault::open(
+        &resolved.path,
+        resolved.vault_id,
+        vault_salt(resolved.vault_id, &resolved.name),
+        VaultOptions {
+            restore_mvcc_rows: false,
+            ..VaultOptions::default()
+        },
+    )?;
+    let lifecycle = GraphCollectionLifecycle::new(&vault)?;
+    let mut state = GraphCollectionGenerationState::new(
+        collection.to_string(),
+        generation.to_string(),
+        GraphCollectionGenerationStatus::Accepted,
+        "materialize-evidence-substrate",
+    )
+    .with_reason("physical graph, CSR, and report readback passed")
+    .with_detail("schema", "evidence_substrate_v1")
+    .with_detail("node_rows", report.readback.node_rows_written.to_string())
+    .with_detail("edge_rows", report.readback.edge_rows_written.to_string())
+    .with_detail("csr_sha256", report.readback.csr_sha256.clone());
+    if let Some(path) = report_path {
+        state = state.with_detail("report", path.display().to_string());
+    }
+    lifecycle.put_state(&state)?;
+    vault.flush()?;
+    drop(vault);
+    let lifecycle = PhysicalGraphCollectionLifecycle::open_latest(&resolved.path)?;
+    let accepted = lifecycle.list_states()?.into_iter().any(|row| {
+        row.state.collection == collection
+            && row.state.generation == generation
+            && row.state.status == GraphCollectionGenerationStatus::Accepted
+    });
+    if !accepted {
+        return Err(CliError::runtime(format!(
+            "accepted graph collection lifecycle row missing after readback: {collection}/{generation}"
+        )));
+    }
+    Ok(())
+}
+
+fn read_back_nodes(
+    physical: &PhysicalPlainGraph,
+    node_values: &BTreeMap<CxId, Vec<u8>>,
+) -> CliResult {
+    let physical_nodes = physical.node_props()?;
+    if physical_nodes.len() != node_values.len() {
+        return Err(CliError::from(CalyxError {
+            code: "CALYX_EVIDENCE_SUBSTRATE_NODE_KEY_READBACK_MISMATCH",
+            message: format!(
+                "physical Graph CF node range count mismatch: expected {} read {}",
+                node_values.len(),
+                physical_nodes.len()
+            ),
+            remediation: "do not trust the evidence substrate collection until the physical node range count matches the written node set",
+        }));
+    }
+    for (id, actual) in physical_nodes {
+        let expected = node_values.get(&id).ok_or_else(|| {
+            CliError::from(CalyxError {
+                code: "CALYX_EVIDENCE_SUBSTRATE_NODE_READBACK_EXTRA",
+                message: format!("physical Graph CF node row {id} was not in the written node set"),
+                remediation: "do not trust the evidence substrate collection until every node reads back",
+            })
+        })?;
+        if &actual != expected {
+            return Err(CliError::from(CalyxError {
+                code: "CALYX_EVIDENCE_SUBSTRATE_NODE_READBACK_MISMATCH",
+                message: format!("physical Graph CF node row {id} differed after flush"),
+                remediation: "do not trust the evidence substrate collection until the node value mismatch is fixed and rerun",
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn read_back_edges(
+    physical: &PhysicalPlainGraph,
+    edge_values: &[(CxId, String, CxId, Vec<u8>)],
+) -> CliResult<usize> {
+    let physical_edges = physical.edge_out_props()?;
+    if physical_edges.len() != edge_values.len() {
+        return Err(CliError::from(CalyxError {
+            code: "CALYX_EVIDENCE_SUBSTRATE_EDGE_KEY_READBACK_MISMATCH",
+            message: format!(
+                "physical Graph CF edge range count mismatch: expected {} read {}",
+                edge_values.len(),
+                physical_edges.len()
+            ),
+            remediation: "do not trust the evidence substrate collection until the physical edge range count matches the written edge set",
+        }));
+    }
+    let expected = edge_values
+        .iter()
+        .map(|(src, edge_type, dst, value)| ((*src, edge_type.clone(), *dst), value))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    for edge in physical_edges {
+        let key = (edge.src, edge.edge_type, edge.dst);
+        let expected_value = expected.get(&key).ok_or_else(|| {
+            CliError::from(CalyxError {
+                code: "CALYX_EVIDENCE_SUBSTRATE_EDGE_READBACK_EXTRA",
+                message: format!(
+                    "physical Graph CF edge row {} -{}-> {} was not in the written edge set",
+                    key.0, key.1, key.2
+                ),
+                remediation: "do not trust the evidence substrate collection until every edge reads back exactly",
+            })
+        })?;
+        if edge.value != **expected_value {
+            return Err(CliError::from(CalyxError {
+                code: "CALYX_EVIDENCE_SUBSTRATE_EDGE_READBACK_MISMATCH",
+                message: format!(
+                    "physical Graph CF edge row {} -{}-> {} differed after flush",
+                    key.0, key.1, key.2
+                ),
+                remediation: "do not trust the evidence substrate collection until the edge value mismatch is fixed and rerun",
+            }));
+        }
+        seen.insert(key);
+    }
+    if let Some((src, edge_type, dst)) = expected.keys().find(|key| !seen.contains(*key)) {
+        return Err(CliError::from(CalyxError {
+            code: "CALYX_EVIDENCE_SUBSTRATE_EDGE_READBACK_MISSING",
+            message: format!("missing physical Graph CF edge row {src} -{edge_type}-> {dst}"),
+            remediation: "do not trust the evidence substrate collection until every edge reads back",
+        }));
+    }
+    Ok(seen.len())
 }
 
 fn node_props(node: &super::model::EvidenceNode) -> AsterAssocNodeProps {
@@ -286,9 +417,10 @@ fn build_csr_projection(
         .enumerate()
         .map(|(index, id)| (*id, index))
         .collect::<BTreeMap<_, _>>();
-    let mut by_src = vec![Vec::<PlainGraphCsrEdge>::new(); nodes.len()];
+    let mut drafts = Vec::new();
+    let mut max_raw_weight = 0.0_f32;
     let mut association_edges = BTreeSet::new();
-    for (src, edge_type, dst, _) in edge_values {
+    for (src, edge_type, dst, value) in edge_values {
         let Some(src_index) = node_index.get(src).copied() else {
             return Err(CliError::runtime(format!(
                 "CSR source {src} has no node row"
@@ -299,11 +431,18 @@ fn build_csr_projection(
                 "CSR destination {dst} has no node row"
             )));
         }
-        by_src[src_index].push(PlainGraphCsrEdge {
-            dst: *dst,
-            edge_type: edge_type.clone(),
-        });
+        let raw_weight = plain_graph_edge_raw_weight(value)?;
+        max_raw_weight = max_raw_weight.max(raw_weight);
+        drafts.push((src_index, *dst, edge_type.clone(), raw_weight));
         association_edges.insert((*src, *dst));
+    }
+    let mut by_src = vec![Vec::<PlainGraphCsrEdge>::new(); nodes.len()];
+    for (src_index, dst, edge_type, raw_weight) in drafts {
+        by_src[src_index].push(PlainGraphCsrEdge {
+            dst,
+            edge_type,
+            weight: plain_graph_normalized_edge_weight(raw_weight, max_raw_weight)?,
+        });
     }
     let mut offsets = Vec::with_capacity(nodes.len() + 1);
     let mut edges = Vec::with_capacity(edge_values.len());

@@ -3,7 +3,16 @@ use calyx_core::{AnchorKind, Modality};
 use super::super::*;
 
 mod flows;
-use flows::{chain_walks_tokens, discovery_chain_tokens, probe_matrix_tokens};
+use flows::{
+    chain_walks_tokens, discovery_chain_tokens, graph_collection_generations_tokens,
+    graph_collection_state_tokens, probe_matrix_tokens,
+};
+mod falsification_tokens;
+use falsification_tokens::hypothesis_falsification_tokens;
+mod validation_tokens;
+use validation_tokens::association_validation_tokens;
+mod typed_miner_tokens;
+use typed_miner_tokens::typed_association_miner_tokens;
 
 pub(super) fn subcommand_tokens(command: &Subcommand) -> Vec<String> {
     match command {
@@ -35,12 +44,23 @@ pub(super) fn subcommand_tokens(command: &Subcommand) -> Vec<String> {
         }
         Subcommand::RetireLens(args) => slot_tokens("retire-lens", args),
         Subcommand::ParkLens(args) => slot_tokens("park-lens", args),
-        Subcommand::RetireVault(args) => vec![
-            "retire-vault".to_string(),
-            args.vault.clone(),
-            "--reason".to_string(),
-            args.reason.clone(),
-        ],
+        Subcommand::RetireVault(args) => {
+            let mut out = vec![
+                "retire-vault".to_string(),
+                args.vault.clone(),
+                "--reason".to_string(),
+                args.reason.clone(),
+            ];
+            push_opt(&mut out, "--superseded-by", args.superseded_by.as_deref());
+            push_opt(&mut out, "--source-issue", args.source_issue.as_deref());
+            push_opt(
+                &mut out,
+                "--fsv-readback",
+                args.fsv_readback.as_ref().and_then(|path| path.to_str()),
+            );
+            push_opt(&mut out, "--fsv-sha256", args.fsv_sha256.as_deref());
+            out
+        }
         Subcommand::ListPanel(args) => vec!["list-panel".to_string(), args.vault.clone()],
         Subcommand::Ingest(args) => ingest_tokens(args),
         Subcommand::IngestStatus(args) => vec![
@@ -107,6 +127,13 @@ pub(super) fn subcommand_tokens(command: &Subcommand) -> Vec<String> {
         Subcommand::MaterializeBridgeCorpus(args) => bridge_corpus_tokens(args),
         Subcommand::MaterializeMolecularVault(args) => molecular_vault_tokens(args),
         Subcommand::MaterializeEvidenceSubstrate(args) => evidence_substrate_tokens(args),
+        Subcommand::MaterializeLincsReversal(args) => lincs_reversal_tokens(args),
+        Subcommand::AssembleHypothesisEvidence(args) => hypothesis_evidence::tokens(args),
+        Subcommand::AssociationValidationGates(args) => association_validation_tokens(args),
+        Subcommand::TypedAssociationMiner(args) => typed_association_miner_tokens(args),
+        Subcommand::HypothesisFalsificationSweep(args) => hypothesis_falsification_tokens(args),
+        Subcommand::GraphCollectionGenerations(args) => graph_collection_generations_tokens(args),
+        Subcommand::GraphCollectionState(args) => graph_collection_state_tokens(args),
         Subcommand::DiscoveryChain(args) => discovery_chain_tokens(args),
         Subcommand::ChainWalks(args) => chain_walks_tokens(args),
         Subcommand::ProbeMatrix(args) => probe_matrix_tokens(args),
@@ -178,6 +205,46 @@ fn evidence_substrate_tokens(
     out
 }
 
+fn lincs_reversal_tokens(args: &lincs_reversal::MaterializeLincsReversalArgs) -> Vec<String> {
+    let mut out = vec![
+        "materialize-lincs-reversal".to_string(),
+        args.vault.clone(),
+        "--root".to_string(),
+        args.root.to_string_lossy().into_owned(),
+    ];
+    push_opt(
+        &mut out,
+        "--metadata-root",
+        args.metadata_root.as_ref().and_then(|p| p.to_str()),
+    );
+    push_opt(&mut out, "--collection", args.collection.as_deref());
+    push_opt(
+        &mut out,
+        "--report",
+        args.report.as_ref().and_then(|p| p.to_str()),
+    );
+    push_opt(
+        &mut out,
+        "--home",
+        args.home.as_ref().and_then(|p| p.to_str()),
+    );
+    out
+}
+
+fn lincs_reversal_round_trips_through_tokens() {
+    let command =
+        Subcommand::MaterializeLincsReversal(lincs_reversal::MaterializeLincsReversalArgs {
+            vault: "corpus".to_string(),
+            root: "/fsv/lincs".into(),
+            metadata_root: Some("/fsv/lincs-metadata".into()),
+            collection: Some("biomed_lincs_cmap_reversal_v1".to_string()),
+            report: Some("/fsv/readback.json".into()),
+            home: Some("/home/calyx".into()),
+        });
+    let tokens = subcommand_tokens(&command);
+    assert_eq!(parse(&tokens).unwrap(), command);
+}
+
 #[test]
 fn probe_matrix_guard_tau_round_trips_through_tokens() {
     let command = Subcommand::ProbeMatrix(probe_matrix::ProbeMatrixArgs {
@@ -212,6 +279,8 @@ fn chain_walks_round_trips_through_tokens() {
         novelty_weight: 0.25,
         max_hypotheses_per_seed: 3,
         min_terminal_confidence: 0.5,
+        assay_domain: "issue1205".to_string(),
+        assay_anchor: AnchorKind::Label("known-outcome".to_string()),
         out: Some("target/chain-walks.json".into()),
     });
     let tokens = subcommand_tokens(&command);

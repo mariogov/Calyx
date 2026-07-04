@@ -6,13 +6,16 @@ pub mod aster_bridge;
 pub mod blind_spot_sweep;
 pub mod chain_walks;
 pub mod corpus_weave_report;
+pub mod cross_vault_chain;
 pub mod dfvs;
 pub mod discovery_chain;
+pub mod discovery_run_manifest;
 pub mod domain_bridges;
 mod error;
 pub mod grounding_gaps;
 pub mod hierarchical;
 pub mod hypothesis_evaluation;
+pub mod hypothesis_evidence;
 pub mod incremental;
 pub mod kernel;
 pub mod kernel_answer;
@@ -48,11 +51,17 @@ pub use blind_spot_sweep::{
 };
 pub use chain_walks::{
     AbcHypothesis, CHAIN_WALK_SCHEMA_VERSION, ChainWalkParams, ChainWalkReport, ChainWalkResult,
-    ChainWalkSeed, ChainWalkSeedKind, run_grounded_chain_walks,
+    ChainWalkSeed, ChainWalkSeedKind, run_chain_walks_with_gate, run_grounded_chain_walks,
 };
 pub use corpus_weave_report::{
     CORPUS_WEAVE_REPORT_SCHEMA_VERSION, CorpusWeaveReport, CorpusWeaveReportParams,
     corpus_weave_report,
+};
+pub use cross_vault_chain::{
+    CROSS_VAULT_CHAIN_SCHEMA_VERSION, ClinicalFrontier, CrossVaultChainCandidate,
+    CrossVaultChainParams, CrossVaultChainReport, CrossVaultDeficit, CrossVaultMolecularCandidate,
+    CrossVaultMolecularGateVerdict, MolecularEndpoint, MolecularKernelState,
+    run_cross_vault_grounded_chain,
 };
 pub use dfvs::{
     DfvsMethod, DfvsResult, bounded_genus_approx, dfvs_approx, genus_estimate, is_tournament,
@@ -61,7 +70,14 @@ pub use dfvs::{
 pub use discovery_chain::{
     DISCOVERY_CHAIN_SCHEMA_VERSION, DiscoveryAcceptedHop, DiscoveryCandidate,
     DiscoveryCandidateLog, DiscoveryChainLog, DiscoveryChainParams, DiscoveryGateVerdict,
-    DiscoveryTermination, run_discovery_chain_with_gate, run_grounded_discovery_chain,
+    DiscoveryTermination, reachability_prior_gate, run_discovery_chain_with_gate,
+    run_grounded_discovery_chain,
+};
+pub use discovery_run_manifest::{
+    DISCOVERY_RUN_MANIFEST_SCHEMA_VERSION, DiscoveryRunManifest, DiscoveryRunReproductionReport,
+    DiscoveryRunReproductionStatus, DiscoveryRunSeal, DiscoveryRunStage, ObservedStageOutput,
+    build_discovery_run_manifest, manifest_sha256, reproduce_discovery_run_manifest,
+    seal_discovery_run_manifest, validate_discovery_run_manifest,
 };
 pub use domain_bridges::{
     DOMAIN_BRIDGE_SCHEMA_VERSION, DomainBridgeCandidate, DomainBridgeGateVerdict,
@@ -81,6 +97,10 @@ pub use hypothesis_evaluation::{
     EvaluatorRun, HYPOTHESIS_EVALUATION_SCHEMA_VERSION, HypothesisEvaluation,
     HypothesisEvaluationInput, HypothesisEvaluationParams, HypothesisEvaluationReport,
     HypothesisEvaluationVerdict, RetrievedEvidence, aggregate_hypothesis_evaluations,
+};
+pub use hypothesis_evidence::{
+    EvidenceSource, HYPOTHESIS_EVIDENCE_ASSEMBLER_VERSION, assemble_hypothesis_evaluation_inputs,
+    chain_report_evidence_cx_ids, hypothesis_evidence_cx_ids,
 };
 pub use incremental::{IncrementalKernelEval, IncrementalResult, NodeAddEdge};
 pub use kernel::{

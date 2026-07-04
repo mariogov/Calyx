@@ -529,6 +529,7 @@ dependencies = [
  "calyx-forge",
  "calyx-fsv",
  "calyx-ledger",
+ "calyx-mincut",
  "calyx-paths",
  "crc32fast",
  "criterion",
@@ -586,6 +587,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "ulid",
+ "ureq",
  "windows-sys 0.61.2",
 ]
 
@@ -681,6 +683,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
 ]
 

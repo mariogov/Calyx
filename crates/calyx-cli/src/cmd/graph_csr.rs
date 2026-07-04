@@ -70,10 +70,28 @@ pub(crate) fn run_materialize_graph_csr_with_home(
         resolved.path.display(),
         args.collection
     );
-    // Before-state readback (physical, read-only) for FSV evidence.
-    let before_bytes = PhysicalPlainGraph::open_latest(&resolved.path, &args.collection)?
-        .read_csr_bytes()?
-        .map(|bytes| bytes.len());
+    // Before-state readback (physical, read-only) for FSV evidence. An older
+    // CSR manifest is stale evidence, not a readable current CSR; continue so
+    // the command can rebuild it, but record the failed before-state.
+    let before_probe = PhysicalPlainGraph::open_latest(&resolved.path, &args.collection)
+        .and_then(|physical| physical.read_csr_bytes());
+    let (before_bytes, before_error) = match before_probe {
+        Ok(bytes) => (bytes.map(|bytes| bytes.len()), None),
+        Err(error) if is_unsupported_csr_version(&error) => {
+            eprintln!(
+                "materialize-graph-csr: before CSR is stale/unsupported code={} message={}",
+                error.code, error.message
+            );
+            (
+                None,
+                Some(json!({
+                    "code": error.code,
+                    "message": error.message,
+                })),
+            )
+        }
+        Err(error) => return Err(CliError::from(error)),
+    };
     eprintln!(
         "materialize-graph-csr: before csr_present={} csr_bytes={:?}",
         before_bytes.is_some(),
@@ -92,11 +110,23 @@ pub(crate) fn run_materialize_graph_csr_with_home(
             ..VaultOptions::default()
         },
     )?;
-    let graph = PlainGraph::new(&vault, &args.collection)?;
     let snapshot = vault.snapshot();
-    let commit = graph
-        .rebuild_csr(snapshot)
+    let physical_source = PhysicalPlainGraph::open_latest(&resolved.path, &args.collection)?;
+    eprintln!("materialize-graph-csr: projecting CSR from physical graph range scans");
+    let (projection, edge_weight_stats) = physical_source
+        .csr_projection_with_legacy_unit_weights(snapshot)
         .map_err(|error| csr_materialize_failed(&args, &resolved.path, &error))?;
+    drop(physical_source);
+    let graph = PlainGraph::new(&vault, &args.collection)?;
+    let commit = graph
+        .write_csr_projection(projection)
+        .map_err(|error| csr_materialize_failed(&args, &resolved.path, &error))?;
+    if edge_weight_stats.legacy_unit_weight_edges > 0 {
+        eprintln!(
+            "materialize-graph-csr: upgraded legacy unweighted edge rows legacy_unit_edge_values={} explicit_weight_edge_values={}",
+            edge_weight_stats.legacy_unit_weight_edges, edge_weight_stats.explicit_weight_edges
+        );
+    }
     vault.flush()?;
     eprintln!(
         "materialize-graph-csr: committed seq={} nodes={} edges={} association_edges={} elapsed_ms={}",
@@ -163,6 +193,7 @@ pub(crate) fn run_materialize_graph_csr_with_home(
         "commit_seq": commit.seq,
         "csr_present_before": before_bytes.is_some(),
         "csr_bytes_before": before_bytes,
+        "csr_before_error": before_error,
         "source_snapshot": csr.source_snapshot,
         "csr_bytes": raw.len(),
         "csr_sha256": sha256_hex(&raw),
@@ -170,6 +201,11 @@ pub(crate) fn run_materialize_graph_csr_with_home(
         "nodes": csr.nodes.len(),
         "csr_edges": csr.edges.len(),
         "association_edge_count": csr.association_edge_count,
+        "edge_weight_decode": {
+            "policy": "explicit-weight-or-legacy-unit",
+            "explicit_weight_edges": edge_weight_stats.explicit_weight_edges,
+            "legacy_unit_weight_edges": edge_weight_stats.legacy_unit_weight_edges,
+        },
         "readback": {
             "source_of_truth": "physical Graph CF latest readback via PhysicalPlainGraph::read_csr + assoc_graph + independent node/edge key enumeration",
             "assoc_graph_nodes": assoc.node_count(),
@@ -209,6 +245,12 @@ fn csr_readback_missing(args: &MaterializeGraphCsrArgs, vault_dir: &std::path::P
         ),
         remediation: "the write did not become durable; check vault flush errors and disk state, then re-run materialize-graph-csr",
     })
+}
+
+fn is_unsupported_csr_version(error: &CalyxError) -> bool {
+    error.code == "CALYX_GRAPH_CORRUPT_ROW"
+        && error.message.contains("persisted CSR manifest version")
+        && error.message.contains("not supported")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
