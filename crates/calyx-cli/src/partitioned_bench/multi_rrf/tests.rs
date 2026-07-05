@@ -1,4 +1,6 @@
+use super::args::Args;
 use super::*;
+use std::path::PathBuf;
 
 #[test]
 fn args_parse_plan_truth_depth_and_tuner_vault() {
@@ -21,6 +23,10 @@ fn args_parse_plan_truth_depth_and_tuner_vault() {
         "truth.i32bin",
         "--fused-ground-truth-manifest",
         "truth.manifest.json",
+        "--ensemble-card",
+        "ensemble_card.json",
+        "--a37-admission-card",
+        "multi_anchor_ensemble_card.json",
         "--recall-floor",
         "0.8",
         "--anneal-vault",
@@ -43,6 +49,14 @@ fn args_parse_plan_truth_depth_and_tuner_vault() {
         Some(PathBuf::from("truth.manifest.json"))
     );
     assert_eq!(args.slot_ground_truth_manifest, None);
+    assert_eq!(
+        args.ensemble_card,
+        Some(PathBuf::from("ensemble_card.json"))
+    );
+    assert_eq!(
+        args.a37_admission_card,
+        Some(PathBuf::from("multi_anchor_ensemble_card.json"))
+    );
     assert_eq!(args.recall_floor, Some(0.8));
     assert_eq!(args.out, None);
     assert_eq!(args.anneal_vault, Some(PathBuf::from("anneal-out")));
@@ -65,6 +79,41 @@ fn args_parse_slot_ground_truth_manifest() {
         args.slot_ground_truth_manifest,
         Some(PathBuf::from("slot-truth.manifest.json"))
     );
+}
+
+#[test]
+fn args_parse_a37_admission_cf_root() {
+    let args = Args::parse(&strings([
+        "--plan",
+        "plan.json",
+        "--a37-admission-cf-root",
+        "admission-db",
+        "--a37-admission-key",
+        "issue791-gate",
+    ]))
+    .unwrap();
+
+    assert_eq!(
+        args.a37_admission_cf_root,
+        Some(PathBuf::from("admission-db"))
+    );
+    assert_eq!(args.a37_admission_key, "issue791-gate");
+}
+
+#[test]
+fn args_reject_a37_file_and_cf_root_together() {
+    let err = Args::parse(&strings([
+        "--plan",
+        "plan.json",
+        "--a37-admission-card",
+        "card.json",
+        "--a37-admission-cf-root",
+        "admission-db",
+    ]))
+    .unwrap_err();
+
+    assert_eq!(err.code(), "CALYX_CLI_USAGE_ERROR");
+    assert!(err.message().contains("mutually exclusive"));
 }
 
 #[test]
