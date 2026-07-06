@@ -1,9 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
 
 use calyx_assay::{DEFAULT_MIN_POWER_RECOVERY_RATIO, MIN_INFORMATIVE_TARGET_ENTROPY_BITS};
-use calyx_registry::LensForgeManifest;
 use serde::Deserialize;
 
 use crate::assay_anchor_audit::AnchorAudit;
@@ -13,6 +11,8 @@ use super::super::args::{Args, StreamMode};
 use super::super::{MIN_A35_LENSES, io_error, local_error};
 use super::evidence::PreEncodeGateEvidence;
 use super::paths::display;
+
+mod roster;
 
 #[derive(Debug, Deserialize)]
 struct BitsReport {
@@ -62,6 +62,9 @@ pub(super) fn validate_before_full_encode(args: &Args) -> CliResult<PreEncodeGat
     if args.a37_admission_cf_root.is_some() {
         return validate_db_admission_before_full_encode(args);
     }
+    if args.diagnostic_bootstrap_without_admission() {
+        return diagnostic_bootstrap_evidence(args);
+    }
     if args.mode.requires_gate() {
         return Err(local_error(
             "CALYX_FSV_ASSAY_STREAM_FBIN_A37_DB_REQUIRED",
@@ -92,7 +95,7 @@ pub(super) fn validate_before_full_encode(args: &Args) -> CliResult<PreEncodeGat
         gate.anchor_audit
             .require_gate_eligible("assay stream-fbin pre-encode grounded anchor gate")?;
     }
-    let streamed_lenses = streamed_manifest_names(args)?;
+    let streamed_lenses = roster::streamed_lens_names(args)?;
     validate_panel_identity(&gate.admitted_lenses, &streamed_lenses, args.mode)?;
     validate_target_entropy(&gate)?;
     validate_lower_bound(&gate)?;
@@ -125,7 +128,7 @@ fn validate_db_admission_before_full_encode(args: &Args) -> CliResult<PreEncodeG
         .iter()
         .map(|lens| lens.name.clone())
         .collect::<Vec<_>>();
-    let streamed_lenses = streamed_manifest_names(args)?;
+    let streamed_lenses = roster::streamed_lens_names(args)?;
     validate_panel_identity(&admitted_lenses, &streamed_lenses, args.mode)?;
     let sufficient = validate_db_gate(&report, args.mode)?;
     let deficit_bits = (report.min_marginal_bits - report.min_best_marginal_bits).max(0.0);
@@ -162,6 +165,36 @@ fn validate_db_admission_before_full_encode(args: &Args) -> CliResult<PreEncodeG
         },
         admitted_lenses,
         streamed_lenses,
+    })
+}
+
+fn diagnostic_bootstrap_evidence(args: &Args) -> CliResult<PreEncodeGateEvidence> {
+    Ok(PreEncodeGateEvidence {
+        mode: args.mode.as_str(),
+        diagnostic_only: true,
+        bits_report: "none:diagnostic_bootstrap_without_a37_admission".to_string(),
+        anchor_entropy_bits: 0.0,
+        sufficiency_basis_bits: 0.0,
+        power_adjusted_target_bits: args.min_bits,
+        deficit_bits: args.min_bits,
+        estimate_bound: "missing_db_admission".to_string(),
+        power_calibration_status: "not_run".to_string(),
+        power_recovery_ratio: 0.0,
+        min_power_recovery_ratio: DEFAULT_MIN_POWER_RECOVERY_RATIO,
+        sufficient: false,
+        grounded_gate_eligible: false,
+        anchor_audit: AnchorAudit {
+            grounded_gate_eligible: false,
+            audit_kind: Some("diagnostic_bootstrap_without_a37_admission".to_string()),
+            source: Some("assay stream-fbin diagnostic bootstrap".to_string()),
+            reason: Some(
+                "no Calyx/Aster A37 admission row supplied; this encode is diagnostic-only"
+                    .to_string(),
+            ),
+            ..AnchorAudit::default()
+        },
+        admitted_lenses: Vec::new(),
+        streamed_lenses: roster::streamed_lens_names(args)?,
     })
 }
 
@@ -407,32 +440,6 @@ fn is_grounded_gate_eligible(audit: &AnchorAudit) -> bool {
         && !audit.anchor_leaks_into_input
         && !audit.trivial_anchor
         && !audit.label_recoverable_from_input
-}
-
-fn streamed_manifest_names(args: &Args) -> CliResult<Vec<String>> {
-    args.manifests
-        .iter()
-        .map(|path| read_manifest_name(path))
-        .collect()
-}
-
-fn read_manifest_name(path: &Path) -> CliResult<String> {
-    let manifest: LensForgeManifest = serde_json::from_slice(&fs::read(path).map_err(io_error)?)
-        .map_err(|error| {
-            local_error(
-                "CALYX_FSV_ASSAY_STREAM_FBIN_LENS_LOAD",
-                format!("parse {} failed: {error}", path.display()),
-                "fix the frozen lens manifests before streaming FBIN",
-            )
-        })?;
-    if manifest.name.trim().is_empty() {
-        return Err(local_error(
-            "CALYX_FSV_ASSAY_STREAM_FBIN_LENS_LOAD",
-            format!("{} has an empty lens name", path.display()),
-            "fix the frozen lens manifest before streaming FBIN",
-        ));
-    }
-    Ok(manifest.name)
 }
 
 fn names_set(label: &str, names: &[String]) -> CliResult<BTreeSet<String>> {

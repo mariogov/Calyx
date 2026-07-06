@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use crate::assay_corpus_build::request::CorpusBuildRequest;
+use calyx_registry::LensSpec;
+
 use crate::error::{CliError, CliResult};
 
 use super::DEFAULT_MIN_BITS;
@@ -32,6 +33,9 @@ pub(crate) struct Args {
     pub(crate) dataset: String,
     pub(crate) target_class: usize,
     pub(crate) manifests: Vec<PathBuf>,
+    pub(crate) lens_template_cf_root: Option<PathBuf>,
+    pub(crate) lens_template_key: String,
+    pub(crate) lens_template_specs: Vec<LensSpec>,
     pub(crate) bits_report: Option<PathBuf>,
     pub(crate) a37_admission_cf_root: Option<PathBuf>,
     pub(crate) a37_admission_key: String,
@@ -47,6 +51,7 @@ pub(crate) struct Args {
     pub(crate) worker_slot: Option<usize>,
     pub(crate) lens_parallelism: usize,
     pub(crate) worker_gpu_mem_limit_mib: Option<usize>,
+    pub(crate) emit_artifacts: bool,
 }
 
 impl Args {
@@ -56,6 +61,8 @@ impl Args {
         let mut dataset = None;
         let mut target_class = None;
         let mut manifests = Vec::new();
+        let mut lens_template_cf_root = None;
+        let mut lens_template_key = super::template::DEFAULT_ASSOCIATION_KEY.to_string();
         let mut bits_report = None;
         let mut a37_admission_cf_root = None;
         let mut a37_admission_key = "a37_multi_anchor_admission".to_string();
@@ -71,6 +78,7 @@ impl Args {
         let mut worker_slot = None;
         let mut lens_parallelism = 1usize;
         let mut worker_gpu_mem_limit_mib = None;
+        let mut emit_artifacts = true;
         let mut it = raw.iter();
         while let Some(flag) = it.next() {
             let mut next = || {
@@ -84,6 +92,8 @@ impl Args {
                 "--dataset" => dataset = Some(next()?),
                 "--target-class" => target_class = Some(parse_usize(&next()?, flag)?),
                 "--manifest" => manifests.push(PathBuf::from(next()?)),
+                "--lens-template-cf-root" => lens_template_cf_root = Some(PathBuf::from(next()?)),
+                "--lens-template-key" => lens_template_key = next()?,
                 "--bits-report" => bits_report = Some(PathBuf::from(next()?)),
                 "--a37-admission-cf-root" => {
                     a37_admission_cf_root = Some(PathBuf::from(next()?));
@@ -104,6 +114,7 @@ impl Args {
                 "--worker-gpu-mem-limit-mib" => {
                     worker_gpu_mem_limit_mib = Some(parse_usize(&next()?, flag)?);
                 }
+                "--db-only" | "--no-artifacts" => emit_artifacts = false,
                 other => {
                     return Err(CliError::usage(format!(
                         "unknown assay stream-fbin arg: {other}"
@@ -119,6 +130,9 @@ impl Args {
             target_class: target_class
                 .ok_or_else(|| CliError::usage("--target-class <n> is required"))?,
             manifests,
+            lens_template_cf_root,
+            lens_template_key,
+            lens_template_specs: Vec::new(),
             bits_report,
             a37_admission_cf_root,
             a37_admission_key,
@@ -135,26 +149,10 @@ impl Args {
             worker_slot,
             lens_parallelism,
             worker_gpu_mem_limit_mib,
+            emit_artifacts,
         };
         args.validate()?;
         Ok(args)
-    }
-
-    pub(crate) fn corpus_request(&self) -> CorpusBuildRequest {
-        CorpusBuildRequest {
-            rows_jsonl: self.rows_jsonl.clone(),
-            out_dir: self.out_dir.clone(),
-            dataset: self.dataset.clone(),
-            target_class: self.target_class,
-            manifests: self.manifests.clone(),
-            limit_per_class: self.limit_per_class,
-            batch_size: self.batch_size,
-            cost_override_json: self.cost_override_json.clone(),
-            embedding_model_id: self.embedding_model_id.clone(),
-            worker_report: None,
-            lens_parallelism: self.lens_parallelism,
-            worker_gpu_mem_limit_mib: self.worker_gpu_mem_limit_mib,
-        }
     }
 
     fn validate(&self) -> CliResult {
@@ -162,6 +160,7 @@ impl Args {
             return Err(CliError::usage("--dataset must be non-empty"));
         }
         let worker_mode = self.worker_report.is_some() || self.worker_slot.is_some();
+        let has_lens_template = self.lens_template_cf_root.is_some();
         if worker_mode
             && (self.worker_report.is_none()
                 || self.worker_slot.is_none()
@@ -171,14 +170,37 @@ impl Args {
                 "stream-fbin worker mode requires --worker-report, --worker-slot, and exactly one --manifest",
             ));
         }
-        if !worker_mode && self.manifests.len() < 2 {
+        if worker_mode && has_lens_template {
+            return Err(CliError::usage(
+                "stream-fbin worker mode is file-diagnostic only; DB-native templates run in-process",
+            ));
+        }
+        if !worker_mode && has_lens_template && !self.manifests.is_empty() {
+            return Err(CliError::usage(
+                "provide either --lens-template-cf-root or --manifest entries, not both",
+            ));
+        }
+        if !worker_mode && self.mode.requires_gate() && !has_lens_template {
+            return Err(CliError::usage(
+                "gate mode requires --lens-template-cf-root <dir>; --manifest is diagnostic/import-only",
+            ));
+        }
+        if !worker_mode && !has_lens_template && self.manifests.len() < 2 {
             return Err(CliError::usage("provide at least two --manifest entries"));
+        }
+        if self.lens_template_key.trim().is_empty() {
+            return Err(CliError::usage("--lens-template-key must be non-empty"));
         }
         let has_bits_report = self.bits_report.is_some();
         let has_admission_db = self.a37_admission_cf_root.is_some();
-        if has_bits_report == has_admission_db {
+        if has_bits_report && has_admission_db {
             return Err(CliError::usage(
-                "provide exactly one of --bits-report <json> or --a37-admission-cf-root <dir>",
+                "provide at most one of --bits-report <json> or --a37-admission-cf-root <dir>",
+            ));
+        }
+        if self.mode.requires_gate() && !has_admission_db {
+            return Err(CliError::usage(
+                "gate mode requires --a37-admission-cf-root <dir>",
             ));
         }
         if has_bits_report && self.mode.requires_gate() {
@@ -214,6 +236,24 @@ impl Args {
             return Err(CliError::usage("--worker-gpu-mem-limit-mib must be > 0"));
         }
         Ok(())
+    }
+
+    pub(crate) fn diagnostic_bootstrap_without_admission(&self) -> bool {
+        !self.mode.requires_gate()
+            && self.bits_report.is_none()
+            && self.a37_admission_cf_root.is_none()
+    }
+
+    pub(crate) fn lens_descriptor_ref(&self, lens_name: &str) -> String {
+        match &self.lens_template_cf_root {
+            Some(root) => format!(
+                "aster-graph-cf:{}:{}:{}",
+                root.display(),
+                self.lens_template_key,
+                lens_name
+            ),
+            None => format!("manifest:{lens_name}"),
+        }
     }
 }
 
